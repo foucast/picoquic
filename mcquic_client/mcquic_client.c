@@ -40,7 +40,9 @@
 *   -t secs   stop after this many seconds (default 120)
 *   -k        keep running after the file is complete (until -t), for soak tests
 *   -s secs   statistics interval (default 5)
-*   -A id     integrity hash algorithm to advertise (1-8, default 1)
+*   -A id     advertise only this integrity hash algorithm (1-8); by default the
+*             client advertises 5 (SHA-256 truncated to 8 bytes, mcquic_server's
+*             default) and 1 (SHA-256, the QUICast example server's)
 *   -J 0|1    jittered MC_ACKs, uniform in [0.5, 1.0] x Max ACK Delay (default 1);
 *             0: one MC_ACK each Max ACK Delay, the first at once
 *   -F 0|1    with -J 1, jitter the first MC_ACK of a channel too, in [0, 1.0] x
@@ -477,7 +479,7 @@ int main(int argc, char** argv)
     uint64_t max_run_us = 120 * 1000000ull;
     uint64_t stats_us = 5 * 1000000ull;
     int keep_running = 0;
-    int hash_alg = PICOQUIC_MCQUIC_HASH_SHA256;
+    int hash_alg = 0;
     picoquic_mcquic_ack_policy_t ack_policy;
     picoquic_mcquic_client_params_t params;
     struct sockaddr_in server;
@@ -547,7 +549,14 @@ int main(int argc, char** argv)
     cnx = picoquic_create_cnx(quic, picoquic_null_connection_id, picoquic_null_connection_id,
         (struct sockaddr*)&server, start_time, 0, sni, "h3", 1);
     picoquic_mcquic_set_default_client_params(&params);
-    params.hash_algs[0] = (uint16_t)hash_alg;
+    if (hash_alg != 0) {
+        params.hash_algs[0] = (uint16_t)hash_alg;
+    }
+    else {
+        params.nb_hash_algs = 2;
+        params.hash_algs[0] = PICOQUIC_MCQUIC_HASH_SHA256_64;
+        params.hash_algs[1] = PICOQUIC_MCQUIC_HASH_SHA256;
+    }
     if (cnx == NULL || picoquic_mcquic_enable_client(cnx, &params) != 0 ||
         picoquic_mcquic_set_ack_policy(cnx, &ack_policy) != 0) {
         fprintf(stderr, "cannot create the connection\n");

@@ -50,6 +50,8 @@
 *   -T ms     maximum time a hash waits for its MC_INTEGRITY frame (default 25; 0 sends each at once)
 *   -A id     integrity hash algorithm (1-8, default 5: SHA-256 truncated to 8 bytes)
 *   -D ms     Max ACK Delay announced in MC_ANNOUNCE, in milliseconds as in draft-08 (default 25)
+*   -R kibps  Max Rate announced in MC_ANNOUNCE (default: the largest datagram,
+*             1,046 bytes, every interval, with 25% headroom; 5,108 Kibps at -i 2000)
 *
 * Statistics include, per client, the MC_ACKs received (frames, bytes, ranges
 * per frame) and the unicast packets and bytes sent; with the sender log on
@@ -81,6 +83,8 @@
 #define QMCF_KIND_CHUNK 2
 #define MCS_MAX_PACKET 2048
 #define MCS_CHUNK_LENGTH 1024
+/* "QMCF", version, kind, transfer ID, chunk index, length, then the chunk */
+#define MCS_CHUNK_DATAGRAM_LENGTH (4 + 1 + 1 + 8 + 4 + 4 + MCS_CHUNK_LENGTH)
 #define MCS_MANIFEST_INTERVAL 32
 
 typedef struct st_mcs_file_t {
@@ -251,7 +255,7 @@ static void mcs_print_stats(picoquic_quic_t* quic, uint64_t start_time)
 static void usage(void)
 {
     fprintf(stderr, "usage: mcquic_server -a addr -c cert -k key -f file [-S source] [-I if_addr] [-g group] [-P port] [-i us] "
-        "[-t secs] [-s secs] [-H n] [-T ms] [-A id] [-D ms] port\n");
+        "[-t secs] [-s secs] [-H n] [-T ms] [-A id] [-D ms] [-R kibps] port\n");
     exit(1);
 }
 
@@ -323,6 +327,7 @@ int main(int argc, char** argv)
     uint64_t max_run_us = 600 * 1000000ull;
     uint64_t stats_us = 5 * 1000000ull;
     size_t batch_max = 256;
+    uint64_t max_rate_kibps = 0;
     uint64_t batch_hold_us = 25000;
     picoquic_packet_loop_param_t param;
     mcs_loop_ctx_t lc;
@@ -336,7 +341,7 @@ int main(int argc, char** argv)
     picoquic_mcquic_set_default_sender_config(&config);
     config.hash_alg = 5; /* SHA-256 truncated to 8 bytes */
     memcpy(&group, config.group, 4);
-    while ((opt = getopt(argc, argv, "a:c:k:f:S:I:g:P:i:t:s:H:T:A:D:")) != -1) {
+    while ((opt = getopt(argc, argv, "a:c:k:f:S:I:g:P:i:t:s:H:T:A:D:R:")) != -1) {
         switch (opt) {
         case 'a': if (inet_pton(AF_INET, optarg, &addr) != 1) usage(); break;
         case 'c': cert = optarg; break;
@@ -353,6 +358,7 @@ int main(int argc, char** argv)
         case 'T': batch_hold_us = (uint64_t)atoi(optarg) * 1000ull; break;
         case 'A': config.hash_alg = (uint16_t)atoi(optarg); if (picoquic_mcquic_hash_length(config.hash_alg) == 0) usage(); break;
         case 'D': config.max_ack_delay_ms = (uint64_t)atoll(optarg); break;
+        case 'R': max_rate_kibps = (uint64_t)atoll(optarg); if (max_rate_kibps == 0) usage(); break;
         default: usage();
         }
     }
@@ -362,6 +368,11 @@ int main(int argc, char** argv)
     if (source.s_addr == 0) {
         source = addr;
     }
+    /* The announced Max Rate covers the largest datagram (a full chunk) every
+     * interval, with headroom, unless -R sets it (draft-08 10.1: receivers
+     * SHOULD leave a channel that exceeds it) */
+    config.max_rate_kibps = (max_rate_kibps != 0) ? max_rate_kibps :
+        picoquic_mcquic_max_rate_kibps(MCS_CHUNK_DATAGRAM_LENGTH, interval_us, 125);
     if (if_addr.s_addr == 0) {
         if_addr = addr;
     }
@@ -395,9 +406,10 @@ int main(int argc, char** argv)
     mcs_print_time();
     printf("channel qmcfile1: source=%s ", inet_ntoa(source));
     printf("group=%s:%u ", inet_ntoa(group), config.port);
-    printf("interface=%s interval=%lluus hash_alg=%u hashes_per_integrity=%zu max_hold=%llums max_ack_delay=%llums\n",
+    printf("interface=%s interval=%lluus hash_alg=%u hashes_per_integrity=%zu max_hold=%llums max_ack_delay=%llums max_rate=%lluKibps\n",
         inet_ntoa(if_addr), (unsigned long long)interval_us, config.hash_alg, batch_max,
-        (unsigned long long)(batch_hold_us / 1000), (unsigned long long)config.max_ack_delay_ms);
+        (unsigned long long)(batch_hold_us / 1000), (unsigned long long)config.max_ack_delay_ms,
+        (unsigned long long)config.max_rate_kibps);
     fflush(stdout);
 
     memset(&param, 0, sizeof(param));

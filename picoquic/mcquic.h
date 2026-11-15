@@ -292,6 +292,7 @@ typedef struct st_picoquic_mcquic_ack_policy_t {
     double test_drop;
 } picoquic_mcquic_ack_policy_t;
 int picoquic_mcquic_set_ack_policy(picoquic_cnx_t* cnx, const picoquic_mcquic_ack_policy_t* policy);
+int picoquic_mcquic_get_ack_policy(picoquic_cnx_t* cnx, picoquic_mcquic_ack_policy_t* policy);
 /* Logs control events (MC_ANNOUNCE, MC_KEY, MC_JOIN, MC_LIMITS, MC_STATE, failures) to f; NULL to stop. */
 void picoquic_mcquic_set_log(picoquic_cnx_t* cnx, FILE* f);
 int picoquic_mcquic_get_stats(picoquic_cnx_t* cnx, const picoquic_mcquic_channel_id_t* channel_id,
@@ -350,6 +351,10 @@ typedef struct st_picoquic_mcquic_sender_stats_t {
     uint64_t largest_acked;
 } picoquic_mcquic_sender_stats_t;
 
+/* Max Rate, in Kibps as MC_ANNOUNCE carries it, for one payload of
+ * payload_bytes every interval_us, times headroom_percent / 100, rounded up.
+ * 0 if interval_us is 0. */
+uint64_t picoquic_mcquic_max_rate_kibps(size_t payload_bytes, uint64_t interval_us, unsigned int headroom_percent);
 /* The QUICast example server's constants; the source address is left to the caller. */
 void picoquic_mcquic_set_default_sender_config(picoquic_mcquic_sender_config_t* config);
 int picoquic_mcquic_sender_create(picoquic_quic_t* quic, const picoquic_mcquic_sender_config_t* config);
@@ -362,6 +367,7 @@ int picoquic_mcquic_get_client_ack_stats(picoquic_cnx_t* cnx, picoquic_mcquic_cl
  * (capped so the frame fits the path MTU), sent when max_hashes are pending or
  * the oldest has waited max_hold_us. The default is 1 hash per frame. */
 int picoquic_mcquic_sender_set_integrity_batch(picoquic_quic_t* quic, size_t max_hashes, uint64_t max_hold_us);
+int picoquic_mcquic_sender_get_integrity_batch(picoquic_quic_t* quic, size_t* max_hashes, uint64_t* max_hold_us);
 /* Sends the batches that are due, or all pending ones if force is set.
  * Returns the time at which the next batch is due, UINT64_MAX if none. */
 uint64_t picoquic_mcquic_sender_flush(picoquic_quic_t* quic, uint64_t current_time, int force);

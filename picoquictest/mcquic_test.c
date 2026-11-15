@@ -546,6 +546,13 @@ int mcquic_kat_ack_policy_test(void)
     MCQUIC_TEST_CHECK(picoquic_mcquic_ack_ranges_fit(13, pairs, 8) == 6);
     MCQUIC_TEST_CHECK(picoquic_mcquic_ack_ranges_fit(100, pairs, 8) == 8);
     MCQUIC_TEST_CHECK(picoquic_mcquic_ack_ranges_fit(0, pairs, 8) == 0);
+
+    /* Max Rate from the publish interval: a 1,046-byte datagram every 2 ms is
+     * 4,085.9 Kibps, 5,107.4 with 25% headroom, rounded up; every 20 ms, 510.7 */
+    MCQUIC_TEST_CHECK(picoquic_mcquic_max_rate_kibps(1046, 2000, 125) == 5108);
+    MCQUIC_TEST_CHECK(picoquic_mcquic_max_rate_kibps(1046, 20000, 125) == 511);
+    MCQUIC_TEST_CHECK(picoquic_mcquic_max_rate_kibps(1024, 1000, 100) == 8000);
+    MCQUIC_TEST_CHECK(picoquic_mcquic_max_rate_kibps(1046, 0, 125) == 0);
     return 0;
 }
 
@@ -792,7 +799,10 @@ int mcquic_receive_test(void)
     if (ret == 0) {
         /* MC_ACKs as the QUICast client sends them: the first at once, no jitter */
         picoquic_mcquic_ack_policy_t policy = { 0, 0, 0.0 };
-        if (picoquic_mcquic_set_ack_policy(cnx, &policy) != 0) {
+        picoquic_mcquic_ack_policy_t got = { 1, 1, 0.5 };
+        if (picoquic_mcquic_get_ack_policy(cnx, &got) != 0 || got.jitter != 1 || got.jitter_first != 1 ||
+            picoquic_mcquic_set_ack_policy(cnx, &policy) != 0 ||
+            picoquic_mcquic_get_ack_policy(cnx, &got) != 0 || got.jitter != 0 || got.jitter_first != 0 || got.test_drop != 0.0) {
             ret = -1;
         }
     }

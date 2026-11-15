@@ -1207,6 +1207,17 @@ int picoquic_mcquic_set_ack_policy(picoquic_cnx_t* cnx, const picoquic_mcquic_ac
     return 0;
 }
 
+int picoquic_mcquic_get_ack_policy(picoquic_cnx_t* cnx, picoquic_mcquic_ack_policy_t* policy)
+{
+    picoquic_mcquic_ctx_t* ctx = mcquic_ctx(cnx);
+
+    if (ctx == NULL || ctx->is_server) {
+        return -1;
+    }
+    *policy = ctx->ack_policy;
+    return 0;
+}
+
 void picoquic_mcquic_send_acks(picoquic_cnx_t* cnx, uint64_t current_time, int force)
 {
     picoquic_mcquic_ctx_t* ctx = mcquic_ctx(cnx);
@@ -1912,6 +1923,15 @@ int picoquic_mcquic_receive_client_params(picoquic_cnx_t* cnx, const uint8_t* by
     return 0;
 }
 
+uint64_t picoquic_mcquic_max_rate_kibps(size_t payload_bytes, uint64_t interval_us, unsigned int headroom_percent)
+{
+    /* bits per second x headroom, over 1024 bits per Kibit */
+    uint64_t num = (uint64_t)payload_bytes * 8 * 1000000ull * headroom_percent;
+    uint64_t den = interval_us * 100 * 1024;
+
+    return (den == 0) ? 0 : (num + den - 1) / den;
+}
+
 int picoquic_mcquic_get_client_ack_stats(picoquic_cnx_t* cnx, picoquic_mcquic_client_ack_stats_t* stats)
 {
     picoquic_mcquic_ctx_t* ctx = mcquic_ctx(cnx);
@@ -2103,6 +2123,16 @@ static void mcquic_flush_batch(picoquic_cnx_t* cnx, picoquic_mcquic_ctx_t* ctx, 
         sender->stats.integrity_bytes += bytes - buffer;
     }
     ctx->batch_count = 0;
+}
+
+int picoquic_mcquic_sender_get_integrity_batch(picoquic_quic_t* quic, size_t* max_hashes, uint64_t* max_hold_us)
+{
+    if (quic->mcquic_sender == NULL) {
+        return -1;
+    }
+    *max_hashes = quic->mcquic_sender->batch_max;
+    *max_hold_us = quic->mcquic_sender->batch_hold_us;
+    return 0;
 }
 
 int picoquic_mcquic_sender_set_integrity_batch(picoquic_quic_t* quic, size_t max_hashes, uint64_t max_hold_us)

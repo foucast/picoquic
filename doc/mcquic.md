@@ -43,7 +43,8 @@ the demo programs on non-Windows systems:
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 build/picoquic_ct mcquic_kat_keys mcquic_kat_header mcquic_kat_decrypt mcquic_kat_integrity \
-    mcquic_kat_tp mcquic_kat_frames mcquic_kat_encode mcquic_kat_hash_ids mcquic_receive
+    mcquic_kat_tp mcquic_kat_frames mcquic_kat_encode mcquic_kat_hash_ids mcquic_kat_ack_policy \
+    mcquic_receive
 ```
 
 ## Run the examples
@@ -82,9 +83,41 @@ Both programs print statistics every 5 s:
   and the release delay.
 
 Other options:
-- `mcquic_server -H n -T ms` batches up to `n` hashes per MC_INTEGRITY frame,
-  holding a hash at most `ms`.
-- `-A id` selects the integrity hash algorithm (draft-08 ids 1–8).
+- **Server**
+  - `-i us` sets the publish interval in microseconds. The default is 20,000, or 50 packets/s; `-i 2000` gives 500 packets/s.
+  - `-H n -T ms` batch up to `n` hashes per MC_INTEGRITY frame, each held at
+    most `ms` (defaults 256 and 25 ms). `n` is also capped so the frame fits
+    the path MTU. `-T 0 -H 1` sends one hash per channel packet at once.
+  - `-A id` selects the integrity hash algorithm, draft-08 ids 1–8. The default is 5, SHA-256 truncated to 8 bytes.
+  - `-D ms` sets the Max ACK Delay announced in MC_ANNOUNCE, in milliseconds as
+    in draft-08 (default 25). Draft-09 changes the unit to microseconds.
+  - `-R kibps` sets the announced Max Rate. By default it is derived from the
+    interval: a full 1,046-byte datagram every interval, plus 25% headroom.
+- **Client**
+  - `-J 0|1` selects the MC_ACK schedule.
+    - With jitter (the default), each MC_ACK goes out at a time drawn
+      uniformly in [0.5, 1.0] × Max ACK Delay after the previous one, and the
+      draw is redone every interval. Receivers that joined together therefore
+      don't acknowledge in step, and no MC_ACK is ever later than Max ACK
+      Delay.
+    - `-J 0` sends one MC_ACK per Max ACK Delay, the first at once.
+  - `-F 0|1`: **by default the first MC_ACK of a channel is jittered too,**
+    drawn in [0, 1.0] × Max ACK Delay after the channel's first packet. This
+    departs from draft-08 §10.1, which says clients "SHOULD NOT add any delay
+    to the first MC_ACK of data packets for a channel". `-F 0` restores the
+    draft-08 behaviour, and so does `-J 0`.
+  - `-A id` advertises only that integrity hash algorithm. By default the
+    client advertises 5 and 1, so it joins both `mcquic_server` (5) and the
+    QUICast example server (1); a client that has not advertised the
+    announced algorithm closes the connection.
+  - `-L frac` drops that fraction of channel packets at random before
+    processing. It is meant for tests, to exercise ACK ranges without network
+    loss.
+- **ACK record.** The receiver tracks at least 2 × packet rate × Max ACK Delay
+  packet numbers, and never fewer than 4,096. It keeps as many ranges as fit
+  one MC_ACK in a 1-RTT packet on the path (up to 1,024), and an MC_ACK
+  carries the newest ranges that fit. Draft-08 sets no range limit; QUICast
+  quiche keeps 64 ranges over 4,096 packet numbers.
 - Run either program without arguments for its full usage.
 
 ## Using it from an application
@@ -92,14 +125,16 @@ Other options:
 See the comments in `picoquic/mcquic.h`.
 
 **Client:**
-1. Call `picoquic_mcquic_enable_client()` on the connection before it starts.
+1. Call `picoquic_mcquic_enable_client()` on the connection before it starts,
+   and optionally `picoquic_mcquic_set_ack_policy()` to choose the MC_ACK schedule.
 2. Either call `picoquic_mcquic_loop_config()` so that the packet loop handles
    the channel sockets, or open them yourself on `picoquic_callback_mc_join`
    and pass packets to `picoquic_incoming_multicast_packet()`.
 3. Channel datagrams arrive as `picoquic_callback_mc_datagram`.
 
 **Server:**
-1. Call `picoquic_mcquic_sender_create()` on the context.
+1. Call `picoquic_mcquic_sender_create()` on the context, and
+   optionally `picoquic_mcquic_sender_set_integrity_batch()`.
 2. Call `picoquic_mcquic_server_start()` on each connection that is ready.
 3. Call `picoquic_mcquic_sender_publish()` for each datagram.
 
