@@ -953,6 +953,13 @@ namespace UnitTest1
             Assert::AreEqual(ret, 0);
         }
 
+        TEST_METHOD(mcquic_kat_ack_policy)
+        {
+            int ret = mcquic_kat_ack_policy_test();
+
+            Assert::AreEqual(ret, 0);
+        }
+
         TEST_METHOD(mcquic_receive)
         {
             int ret = mcquic_receive_test();

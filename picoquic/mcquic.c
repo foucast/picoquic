@@ -52,8 +52,15 @@
 #define MCQUIC_IP_FLAG_V4 0x01
 #define MCQUIC_IP_FLAG_V6 0x02
 #define MCQUIC_RING_SIZE 2048
-#define MCQUIC_MAX_ACK_RANGES 64
-#define MCQUIC_ACK_HISTORY 4096
+/* The ACK record: quiche keeps 64 ranges over the last 4096 packet numbers.
+ * Here the window is at least 2 x packet rate x Max ACK Delay (never under
+ * 4096 nor over 2^20), and the range count is bounded by what fits one MC_ACK
+ * in a 1-RTT packet on the path, and by the tracker's size. */
+#define MCQUIC_MAX_TRACKED_RANGES 1024
+#define MCQUIC_ACK_WINDOW_MIN 4096
+#define MCQUIC_ACK_WINDOW_MAX (1ull << 20)
+/* MC_ACK fixed part: 4-byte type, ID length, ID, then four varints at their largest */
+#define MCQUIC_ACK_FIXED(id_len) (4 + 1 + (id_len) + 8 + 8 + 8 + 8)
 #define MCQUIC_MAX_PACKET 2048
 #define MCQUIC_LABEL_PREFIX "tls13 "
 #define MCQUIC_AEGIS_256_SHA512 0x1307
@@ -107,13 +114,19 @@ typedef struct st_mcquic_channel_t {
     uint64_t largest_pn;
     mcquic_pending_packet_t* packets;
     mcquic_pending_hash_t* hashes;
-    mcquic_range_t ranges[MCQUIC_MAX_ACK_RANGES + 1];
+    mcquic_range_t ranges[MCQUIC_MAX_TRACKED_RANGES + 1];
     size_t nb_ranges;
+    size_t max_ranges;
+    uint64_t ack_window;
     uint64_t retired_before;
     int ack_pending;
     int ack_sent_once;
+    int ack_scheduled;
+    uint64_t next_ack_time;
     uint64_t last_ack_time;
     uint64_t largest_recv_time;
+    uint64_t rate_first_pn;
+    uint64_t rate_first_time;
     picoquic_mcquic_stats_t stats;
 } mcquic_channel_t;
 
@@ -130,6 +143,13 @@ typedef struct st_picoquic_mcquic_ctx_t {
     uint8_t* batch_hashes;
     uint64_t acks_received;
     uint64_t largest_acked;
+    picoquic_mcquic_ack_policy_t ack_policy;
+    /* Server side: MC_ACKs from this client */
+    uint64_t client_index;
+    uint64_t ack_bytes;
+    uint64_t ack_first_time;
+    uint64_t ack_last_time;
+    uint32_t ack_ranges_hist[MCQUIC_MAX_TRACKED_RANGES + 2];
     int server_support;
     uint64_t limits_sequence;
     mcquic_channel_t* first_channel;
@@ -777,6 +797,8 @@ int picoquic_mcquic_enable_client(picoquic_cnx_t* cnx, const picoquic_mcquic_cli
     else {
         ctx->params = *params;
     }
+    ctx->ack_policy.jitter = 1;
+    ctx->ack_policy.jitter_first = 1;
     cnx->mcquic_ctx = ctx;
     return 0;
 }
@@ -950,19 +972,59 @@ int picoquic_mcquic_receive_server_support(picoquic_cnx_t* cnx, uint64_t extensi
     return ret;
 }
 
-/* Acknowledgement ranges, as quiche's AckTracker: ascending disjoint ranges,
- * at most 64 of them, covering at most the last 4096 packet numbers. */
+/* Acknowledgement ranges, after quiche's AckTracker: ascending disjoint ranges
+ * over the last ack_window packet numbers, at most max_ranges of them. */
 static int mcquic_ack_contains(const mcquic_channel_t* ch, uint64_t pn)
 {
     if (pn < ch->retired_before) {
         return 1;
     }
-    for (size_t i = 0; i < ch->nb_ranges; i++) {
-        if (ch->ranges[i].start <= pn && pn <= ch->ranges[i].end) {
+    for (size_t i = ch->nb_ranges; i > 0; i--) {
+        if (ch->ranges[i - 1].start <= pn && pn <= ch->ranges[i - 1].end) {
             return 1;
+        }
+        if (ch->ranges[i - 1].end < pn) {
+            break;
         }
     }
     return 0;
+}
+
+/* Bytes available for the ranges of one MC_ACK in a 1-RTT packet on the path:
+ * short header with the largest connection ID and packet number, AEAD tag, and
+ * the frame's fixed part. */
+static size_t mcquic_ack_budget(picoquic_cnx_t* cnx, const mcquic_channel_t* ch)
+{
+    size_t mtu = (cnx->path != NULL && cnx->path[0] != NULL && cnx->path[0]->send_mtu > 0) ?
+        cnx->path[0]->send_mtu : PICOQUIC_INITIAL_MTU_IPV4;
+    size_t overhead = 1 + PICOQUIC_CONNECTION_ID_MAX_SIZE + 4 + 16 + MCQUIC_ACK_FIXED(ch->id.id_len);
+
+    return (mtu > overhead) ? mtu - overhead : 0;
+}
+
+static void mcquic_ack_update_limits(picoquic_cnx_t* cnx, mcquic_channel_t* ch)
+{
+    /* A (gap, length) pair takes at least 2 bytes */
+    size_t cap = mcquic_ack_budget(cnx, ch) / 2 + 1;
+    uint64_t window = MCQUIC_ACK_WINDOW_MIN;
+
+    ch->max_ranges = (cap < MCQUIC_MAX_TRACKED_RANGES) ? cap : MCQUIC_MAX_TRACKED_RANGES;
+    if (ch->has_largest && ch->largest_recv_time > ch->rate_first_time + 100000 && ch->largest_pn > ch->rate_first_pn) {
+        /* Packets per second from the packet numbers released so far */
+        double rate = (double)(ch->largest_pn - ch->rate_first_pn) * 1000000.0 /
+            (double)(ch->largest_recv_time - ch->rate_first_time);
+        double w = 2.0 * rate * (double)ch->max_ack_delay_us / 1000000.0;
+        if (w > (double)MCQUIC_ACK_WINDOW_MAX) {
+            window = MCQUIC_ACK_WINDOW_MAX;
+        }
+        else if (w > (double)window) {
+            window = (uint64_t)w;
+        }
+    }
+    /* The window never shrinks, so that duplicate detection stays monotonic */
+    if (window > ch->ack_window) {
+        ch->ack_window = window;
+    }
 }
 
 static void mcquic_ack_record(mcquic_channel_t* ch, uint64_t pn)
@@ -971,9 +1033,19 @@ static void mcquic_ack_record(mcquic_channel_t* ch, uint64_t pn)
     uint64_t end = pn;
     size_t i = 0;
     uint64_t largest;
+    uint64_t window = (ch->ack_window > 0) ? ch->ack_window : MCQUIC_ACK_WINDOW_MIN;
+    size_t max_ranges = (ch->max_ranges > 0) ? ch->max_ranges : 64;
 
     if (mcquic_ack_contains(ch, pn)) {
         return;
+    }
+    /* Most packets extend the newest range: search from the end */
+    i = ch->nb_ranges;
+    while (i > 0 && ch->ranges[i - 1].start > end + 1) {
+        i--;
+    }
+    while (i > 0 && ch->ranges[i - 1].end + 1 >= start) {
+        i--;
     }
     while (i < ch->nb_ranges) {
         if (end + 1 < ch->ranges[i].start) {
@@ -998,10 +1070,10 @@ static void mcquic_ack_record(mcquic_channel_t* ch, uint64_t pn)
     ch->ranges[i].end = end;
     ch->nb_ranges++;
 
-    /* Trim the history */
+    /* Trim the history to the window */
     largest = ch->ranges[ch->nb_ranges - 1].end;
-    if (largest >= MCQUIC_ACK_HISTORY - 1 && largest - (MCQUIC_ACK_HISTORY - 1) > ch->retired_before) {
-        ch->retired_before = largest - (MCQUIC_ACK_HISTORY - 1);
+    if (largest >= window - 1 && largest - (window - 1) > ch->retired_before) {
+        ch->retired_before = largest - (window - 1);
     }
     while (ch->nb_ranges > 0 && ch->ranges[0].end < ch->retired_before) {
         memmove(&ch->ranges[0], &ch->ranges[1], (ch->nb_ranges - 1) * sizeof(mcquic_range_t));
@@ -1010,25 +1082,44 @@ static void mcquic_ack_record(mcquic_channel_t* ch, uint64_t pn)
     if (ch->nb_ranges > 0 && ch->ranges[0].start < ch->retired_before) {
         ch->ranges[0].start = ch->retired_before;
     }
-    if (ch->nb_ranges > MCQUIC_MAX_ACK_RANGES) {
-        size_t remove = ch->nb_ranges - MCQUIC_MAX_ACK_RANGES;
-        memmove(&ch->ranges[0], &ch->ranges[remove], MCQUIC_MAX_ACK_RANGES * sizeof(mcquic_range_t));
-        ch->nb_ranges = MCQUIC_MAX_ACK_RANGES;
+    if (ch->nb_ranges > max_ranges) {
+        size_t remove = ch->nb_ranges - max_ranges;
+        memmove(&ch->ranges[0], &ch->ranges[remove], max_ranges * sizeof(mcquic_range_t));
+        ch->nb_ranges = max_ranges;
         if (ch->ranges[0].start > ch->retired_before) {
             ch->retired_before = ch->ranges[0].start;
         }
     }
+    ch->stats.ack_window = window;
     ch->ack_pending = 1;
+}
+
+size_t picoquic_mcquic_ack_ranges_fit(size_t budget, const uint64_t* gaps_lengths, size_t nb_pairs)
+{
+    size_t used = 0;
+    size_t n = 0;
+
+    while (n < nb_pairs) {
+        size_t l = picoquic_frames_varint_encode_length(gaps_lengths[2 * n]) +
+            picoquic_frames_varint_encode_length(gaps_lengths[2 * n + 1]);
+        if (used + l > budget) {
+            break;
+        }
+        used += l;
+        n++;
+    }
+    return n;
 }
 
 static int mcquic_send_ack(picoquic_cnx_t* cnx, mcquic_channel_t* ch, uint64_t current_time)
 {
     picoquic_mcquic_frame_t f;
-    uint8_t ranges[MCQUIC_MAX_ACK_RANGES * 16];
+    uint8_t ranges[MCQUIC_MAX_TRACKED_RANGES * 16];
     uint8_t* bytes = ranges;
     const mcquic_range_t* newest = &ch->ranges[ch->nb_ranges - 1];
     uint64_t smallest = newest->start;
     uint64_t delay = 0;
+    size_t budget = mcquic_ack_budget(cnx, ch);
     int ret;
 
     memset(&f, 0, sizeof(f));
@@ -1036,10 +1127,17 @@ static int mcquic_send_ack(picoquic_cnx_t* cnx, mcquic_channel_t* ch, uint64_t c
     f.channel_id = ch->id;
     f.u.ack.largest = newest->end;
     f.u.ack.first_range = newest->end - newest->start;
+    /* Newest ranges first, as many as fit the packet; older ones are left out */
     for (size_t i = ch->nb_ranges - 1; i > 0 && bytes != NULL; i--) {
         const mcquic_range_t* span = &ch->ranges[i - 1];
-        if ((bytes = picoquic_frames_varint_encode(bytes, ranges + sizeof(ranges), smallest - span->end - 2)) != NULL) {
-            bytes = picoquic_frames_varint_encode(bytes, ranges + sizeof(ranges), span->end - span->start);
+        uint64_t gap = smallest - span->end - 2;
+        uint64_t len = span->end - span->start;
+        if ((size_t)(bytes - ranges) + picoquic_frames_varint_encode_length(gap) +
+            picoquic_frames_varint_encode_length(len) > budget) {
+            break;
+        }
+        if ((bytes = picoquic_frames_varint_encode(bytes, ranges + sizeof(ranges), gap)) != NULL) {
+            bytes = picoquic_frames_varint_encode(bytes, ranges + sizeof(ranges), len);
         }
         smallest = span->start;
         f.u.ack.range_count++;
@@ -1055,12 +1153,58 @@ static int mcquic_send_ack(picoquic_cnx_t* cnx, mcquic_channel_t* ch, uint64_t c
     f.u.ack.ranges = ranges;
     f.u.ack.ranges_length = bytes - ranges;
     if ((ret = mcquic_queue_frame(cnx, &f)) == 0) {
+        uint8_t tmp[MCQUIC_MAX_PACKET];
+        uint8_t* e = picoquic_mcquic_frame_encode(tmp, tmp + sizeof(tmp), &f);
         ch->ack_pending = 0;
         ch->ack_sent_once = 1;
+        ch->ack_scheduled = 0;
         ch->last_ack_time = current_time;
         ch->stats.acks_sent++;
+        if (e != NULL) {
+            ch->stats.ack_bytes += (uint64_t)(e - tmp);
+        }
+        if (f.u.ack.range_count + 1 > ch->stats.ack_ranges_max) {
+            ch->stats.ack_ranges_max = f.u.ack.range_count + 1;
+        }
     }
     return ret;
+}
+
+/* Time the next MC_ACK of a channel with pending acknowledgements is due.
+ * Draws it on first use after each MC_ACK when the policy jitters. */
+static uint64_t mcquic_ack_due(picoquic_mcquic_ctx_t* ctx, mcquic_channel_t* ch, uint64_t current_time)
+{
+    const picoquic_mcquic_ack_policy_t* pol = &ctx->ack_policy;
+
+    if (!pol->jitter) {
+        /* The first MC_ACK of a channel goes without delay (draft-08 10.1, Max ACK Delay; draft-09 4.4) */
+        return (!ch->ack_sent_once) ? current_time : ch->last_ack_time + ch->max_ack_delay_us;
+    }
+    if (!ch->ack_scheduled) {
+        if (!ch->ack_sent_once) {
+            ch->next_ack_time = (pol->jitter_first && ch->max_ack_delay_us > 0) ?
+                current_time + picoquic_public_uniform_random(ch->max_ack_delay_us + 1) : current_time;
+        }
+        else {
+            /* Uniform in [0.5, 1.0] x Max ACK Delay after the previous MC_ACK */
+            uint64_t half = ch->max_ack_delay_us / 2;
+            ch->next_ack_time = ch->last_ack_time + (ch->max_ack_delay_us - half) +
+                ((half > 0) ? picoquic_public_uniform_random(half + 1) : 0);
+        }
+        ch->ack_scheduled = 1;
+    }
+    return ch->next_ack_time;
+}
+
+int picoquic_mcquic_set_ack_policy(picoquic_cnx_t* cnx, const picoquic_mcquic_ack_policy_t* policy)
+{
+    picoquic_mcquic_ctx_t* ctx = mcquic_ctx(cnx);
+
+    if (ctx == NULL || ctx->is_server || policy->test_drop < 0.0 || policy->test_drop >= 1.0) {
+        return -1;
+    }
+    ctx->ack_policy = *policy;
+    return 0;
 }
 
 void picoquic_mcquic_send_acks(picoquic_cnx_t* cnx, uint64_t current_time, int force)
@@ -1072,8 +1216,7 @@ void picoquic_mcquic_send_acks(picoquic_cnx_t* cnx, uint64_t current_time, int f
     }
     for (mcquic_channel_t* ch = ctx->first_channel; ch != NULL; ch = ch->next) {
         if (ch->joined && ch->ack_pending && ch->nb_ranges > 0 &&
-            (force || !ch->ack_sent_once || current_time >= ch->last_ack_time + ch->max_ack_delay_us)) {
-            /* The first MC_ACK of a channel goes without delay (draft-08 10.1, Max ACK Delay; draft-09 4.4) */
+            (force || current_time >= mcquic_ack_due(ctx, ch, current_time))) {
             (void)mcquic_send_ack(cnx, ch, current_time);
         }
     }
@@ -1368,12 +1511,17 @@ static void mcquic_release_packet(picoquic_cnx_t* cnx, mcquic_channel_t* ch, mcq
         uint64_t bucket = (delay < 100000) ? delay / 100 : 1000 + (delay - 100000) / 1000;
         ch->stats.release_delay[(bucket < PICOQUIC_MCQUIC_DELAY_BUCKETS) ? bucket : PICOQUIC_MCQUIC_DELAY_BUCKETS - 1]++;
     }
+    if (!ch->has_largest) {
+        ch->rate_first_pn = p->pn;
+        ch->rate_first_time = current_time;
+    }
     if (!ch->has_largest || p->pn > ch->largest_pn) {
         ch->has_largest = 1;
         ch->largest_pn = p->pn;
         ch->largest_recv_time = current_time;
         ch->stats.largest_released = p->pn;
     }
+    mcquic_ack_update_limits(cnx, ch);
     mcquic_ack_record(ch, p->pn);
 }
 
@@ -1501,6 +1649,11 @@ static void mcquic_channel_packet(picoquic_cnx_t* cnx, mcquic_channel_t* ch, con
     size_t header_length;
     mcquic_pending_packet_t* p;
 
+    if (mcquic_ctx(cnx)->ack_policy.test_drop > 0.0 &&
+        (double)picoquic_public_uniform_random(1000000) < mcquic_ctx(cnx)->ack_policy.test_drop * 1000000.0) {
+        ch->stats.test_dropped++;
+        return;
+    }
     ch->stats.packets_received++;
     if (ch->has_largest) {
         expected = ch->largest_pn + 1;
@@ -1616,6 +1769,7 @@ typedef struct st_picoquic_mcquic_sender_t {
     size_t batch_max;
     uint64_t batch_hold_us;
     FILE* log_file;
+    uint64_t nb_clients;
     picoquic_mcquic_sender_stats_t stats;
 } picoquic_mcquic_sender_t;
 
@@ -1753,7 +1907,35 @@ int picoquic_mcquic_receive_client_params(picoquic_cnx_t* cnx, const uint8_t* by
     ctx->params = params;
     ctx->is_server = 1;
     ctx->log_file = cnx->quic->mcquic_sender->log_file;
+    ctx->client_index = ++cnx->quic->mcquic_sender->nb_clients;
     cnx->mcquic_ctx = ctx;
+    return 0;
+}
+
+int picoquic_mcquic_get_client_ack_stats(picoquic_cnx_t* cnx, picoquic_mcquic_client_ack_stats_t* stats)
+{
+    picoquic_mcquic_ctx_t* ctx = mcquic_ctx(cnx);
+    uint64_t seen = 0;
+
+    if (ctx == NULL || !ctx->is_server) {
+        return -1;
+    }
+    memset(stats, 0, sizeof(*stats));
+    stats->client_index = ctx->client_index;
+    stats->acks = ctx->acks_received;
+    stats->ack_bytes = ctx->ack_bytes;
+    stats->first_ack_time = ctx->ack_first_time;
+    stats->last_ack_time = ctx->ack_last_time;
+    for (size_t i = 0; i < MCQUIC_MAX_TRACKED_RANGES + 2; i++) {
+        if (ctx->ack_ranges_hist[i] == 0) {
+            continue;
+        }
+        stats->ranges_max = i;
+        if (stats->ranges_p50 == 0 && (seen + ctx->ack_ranges_hist[i]) * 2 >= ctx->acks_received) {
+            stats->ranges_p50 = i;
+        }
+        seen += ctx->ack_ranges_hist[i];
+    }
     return 0;
 }
 
@@ -1823,6 +2005,22 @@ static int mcquic_server_control_frame(picoquic_cnx_t* cnx, picoquic_mcquic_ctx_
     case PICOQUIC_MCQUIC_FRAME_ACK:
     case PICOQUIC_MCQUIC_FRAME_ACK_ECN:
         /* Counted and logged only: there is no multicast retransmission */
+    {
+        uint8_t tmp[MCQUIC_MAX_PACKET];
+        uint8_t* e = picoquic_mcquic_frame_encode(tmp, tmp + sizeof(tmp), f);
+        uint64_t now = picoquic_get_quic_time(cnx->quic);
+        uint64_t nb_ranges = f->u.ack.range_count + 1;
+        uint64_t frame_bytes = (e != NULL) ? (uint64_t)(e - tmp) : 0;
+
+        ctx->ack_bytes += frame_bytes;
+        ctx->ack_ranges_hist[(nb_ranges <= MCQUIC_MAX_TRACKED_RANGES) ? nb_ranges : MCQUIC_MAX_TRACKED_RANGES + 1]++;
+        if (ctx->acks_received == 0) {
+            ctx->ack_first_time = now;
+        }
+        ctx->ack_last_time = now;
+        mcquic_log(ctx, "MC_ACK arrival: client=%llu t_us=%llu ranges=%llu bytes=%llu", (unsigned long long)ctx->client_index,
+            (unsigned long long)now, (unsigned long long)nb_ranges, (unsigned long long)frame_bytes);
+    }
         ctx->acks_received++;
         if (f->u.ack.largest > ctx->largest_acked || ctx->acks_received == 1) {
             ctx->largest_acked = f->u.ack.largest;
@@ -2044,8 +2242,11 @@ uint64_t picoquic_mcquic_service(picoquic_quic_t* quic, uint64_t current_time)
         }
         picoquic_mcquic_send_acks(cnx, current_time, 0);
         for (mcquic_channel_t* ch = ctx->first_channel; ch != NULL; ch = ch->next) {
-            if (ch->joined && ch->ack_pending && ch->nb_ranges > 0 && ch->last_ack_time + ch->max_ack_delay_us < next) {
-                next = ch->last_ack_time + ch->max_ack_delay_us;
+            if (ch->joined && ch->ack_pending && ch->nb_ranges > 0) {
+                uint64_t due = mcquic_ack_due(ctx, ch, current_time);
+                if (due < next) {
+                    next = due;
+                }
             }
         }
     }

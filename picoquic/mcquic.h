@@ -218,6 +218,10 @@ typedef struct st_picoquic_mcquic_stats_t {
     uint64_t largest_released;
     uint64_t integrity_frames;
     uint64_t integrity_bytes; /* MC_INTEGRITY frame bytes, type included */
+    uint64_t test_dropped; /* channel packets dropped by picoquic_mcquic_set_ack_policy's test_drop */
+    uint64_t ack_bytes; /* MC_ACK frame bytes, type included */
+    uint64_t ack_ranges_max; /* most ACK ranges in one MC_ACK */
+    uint64_t ack_window; /* packet numbers the receiver currently tracks */
     /* Time from a channel packet's arrival to its release, by bucket */
     uint32_t release_delay[PICOQUIC_MCQUIC_DELAY_BUCKETS];
 } picoquic_mcquic_stats_t;
@@ -269,10 +273,32 @@ int picoquic_incoming_multicast_packet(picoquic_quic_t* quic, const uint8_t* byt
     const struct sockaddr* addr_from, uint64_t current_time);
 /* Sends MC_ACK frames that are due, or all pending ones if force is set. */
 void picoquic_mcquic_send_acks(picoquic_cnx_t* cnx, uint64_t current_time, int force);
+/* MC_ACK scheduling on a receiving connection.
+ * jitter (default 1): each MC_ACK is sent at a time drawn uniformly in
+ *   [0.5, 1.0] x Max ACK Delay after the previous one, re-drawn every interval,
+ *   so that clients do not acknowledge in step. 0: the previous behaviour, one
+ *   MC_ACK each Max ACK Delay after the last one.
+ * jitter_first (default 1, used with jitter): the first MC_ACK of a channel is
+ *   drawn uniformly in [0, 1.0] x Max ACK Delay after its first packet. draft-08
+ *   10.1 says clients SHOULD NOT delay it; 0 sends it at once.
+ * test_drop: fraction of channel packets dropped at random before processing,
+ *   for tests (0 = none).
+ * The ACK record keeps at least 2 x packet rate x Max ACK Delay packet numbers
+ * (and at least 4096), and as many ranges as fit one MC_ACK in a 1-RTT packet
+ * on the path. */
+typedef struct st_picoquic_mcquic_ack_policy_t {
+    int jitter;
+    int jitter_first;
+    double test_drop;
+} picoquic_mcquic_ack_policy_t;
+int picoquic_mcquic_set_ack_policy(picoquic_cnx_t* cnx, const picoquic_mcquic_ack_policy_t* policy);
 /* Logs control events (MC_ANNOUNCE, MC_KEY, MC_JOIN, MC_LIMITS, MC_STATE, failures) to f; NULL to stop. */
 void picoquic_mcquic_set_log(picoquic_cnx_t* cnx, FILE* f);
 int picoquic_mcquic_get_stats(picoquic_cnx_t* cnx, const picoquic_mcquic_channel_id_t* channel_id,
     picoquic_mcquic_stats_t* stats);
+/* Number of (gap, length) pairs, newest first, whose varints fit in budget
+ * bytes: the rule the receiver applies when it builds an MC_ACK. */
+size_t picoquic_mcquic_ack_ranges_fit(size_t budget, const uint64_t* gaps_lengths, size_t nb_pairs);
 /* Upper bound, in microseconds, of a release delay histogram bucket */
 uint64_t picoquic_mcquic_delay_bucket_limit(size_t bucket);
 
@@ -303,6 +329,17 @@ typedef struct st_picoquic_mcquic_sender_config_t {
     uint64_t max_ack_delay_ms;
 } picoquic_mcquic_sender_config_t;
 
+/* MC_ACKs received from one client (server side) */
+typedef struct st_picoquic_mcquic_client_ack_stats_t {
+    uint64_t client_index; /* order in which the sender saw the connections, from 1 */
+    uint64_t acks;
+    uint64_t ack_bytes; /* MC_ACK frame bytes, type included */
+    uint64_t ranges_max; /* ACK ranges per MC_ACK, First ACK Range counted as one */
+    uint64_t ranges_p50;
+    uint64_t first_ack_time;
+    uint64_t last_ack_time;
+} picoquic_mcquic_client_ack_stats_t;
+
 typedef struct st_picoquic_mcquic_sender_stats_t {
     uint64_t packets_sent;
     uint64_t integrity_sent; /* hashes */
@@ -320,6 +357,7 @@ void picoquic_mcquic_sender_delete(picoquic_quic_t* quic);
 void picoquic_mcquic_sender_set_log(picoquic_quic_t* quic, FILE* f);
 int picoquic_mcquic_sender_get_stats(picoquic_quic_t* quic, picoquic_mcquic_sender_stats_t* stats);
 int picoquic_mcquic_server_start(picoquic_cnx_t* cnx);
+int picoquic_mcquic_get_client_ack_stats(picoquic_cnx_t* cnx, picoquic_mcquic_client_ack_stats_t* stats);
 /* MC_INTEGRITY batching: per client, one frame carries up to max_hashes hashes
  * (capped so the frame fits the path MTU), sent when max_hashes are pending or
  * the oldest has waited max_hold_us. The default is 1 hash per frame. */

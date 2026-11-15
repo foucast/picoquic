@@ -41,6 +41,11 @@
 *   -k        keep running after the file is complete (until -t), for soak tests
 *   -s secs   statistics interval (default 5)
 *   -A id     integrity hash algorithm to advertise (1-8, default 1)
+*   -J 0|1    jittered MC_ACKs, uniform in [0.5, 1.0] x Max ACK Delay (default 1);
+*             0: one MC_ACK each Max ACK Delay, the first at once
+*   -F 0|1    with -J 1, jitter the first MC_ACK of a channel too, in [0, 1.0] x
+*             Max ACK Delay (default 1; draft-08 10.1: SHOULD NOT delay it)
+*   -L frac   drop this fraction of channel packets at random, for tests (default 0)
 */
 
 #ifdef _WINDOWS
@@ -375,7 +380,8 @@ static void mcq_print_stats(picoquic_cnx_t* cnx, mcq_client_t* c)
     printf("[stats] rx=%llu dup=%llu released=%llu evicted=%llu hashes=%llu integrity_fail=%llu header_fail=%llu "
         "decrypt_fail=%llu no_key=%llu unsupported=%llu datagrams=%llu acks_sent=%llu largest=%llu "
         "files_complete=%d chunks=%u/%u qmcf_errors=%llu rss_kb=%ld integrity_frames=%llu integrity_bytes=%llu "
-        "release_delay_p50_ms=%.1f release_delay_p99_ms=%.1f\n",
+        "release_delay_p50_ms=%.1f release_delay_p99_ms=%.1f test_dropped=%llu ack_bytes=%llu ack_ranges_max=%llu "
+        "ack_window=%llu\n",
         (unsigned long long)st.packets_received, (unsigned long long)st.packets_duplicate,
         (unsigned long long)st.packets_released, (unsigned long long)st.packets_evicted,
         (unsigned long long)st.integrity_hashes, (unsigned long long)st.integrity_failures,
@@ -385,13 +391,15 @@ static void mcq_print_stats(picoquic_cnx_t* cnx, mcq_client_t* c)
         (unsigned long long)st.largest_released, c->file.completions, c->file.received_count,
         c->file.total_chunks, (unsigned long long)c->decode_errors, mcq_rss_kb(),
         (unsigned long long)st.integrity_frames, (unsigned long long)st.integrity_bytes,
-        mcq_delay_percentile(&st, 0.50), mcq_delay_percentile(&st, 0.99));
+        mcq_delay_percentile(&st, 0.50), mcq_delay_percentile(&st, 0.99), (unsigned long long)st.test_dropped,
+        (unsigned long long)st.ack_bytes, (unsigned long long)st.ack_ranges_max, (unsigned long long)st.ack_window);
     fflush(stdout);
 }
 
 static void usage(void)
 {
-    fprintf(stderr, "Usage: mcquic_client [-i if_addr] [-o file] [-n sni] [-t secs] [-k] [-s secs] server_address port\n");
+    fprintf(stderr, "Usage: mcquic_client [-i if_addr] [-o file] [-n sni] [-t secs] [-k] [-s secs] [-A id] [-J 0|1] [-F 0|1] [-L frac] "
+        "server_address port\n");
     exit(1);
 }
 
@@ -470,6 +478,7 @@ int main(int argc, char** argv)
     uint64_t stats_us = 5 * 1000000ull;
     int keep_running = 0;
     int hash_alg = PICOQUIC_MCQUIC_HASH_SHA256;
+    picoquic_mcquic_ack_policy_t ack_policy;
     picoquic_mcquic_client_params_t params;
     struct sockaddr_in server;
     struct sockaddr_in if_sa;
@@ -482,7 +491,10 @@ int main(int argc, char** argv)
     int ret = 0;
 
     memset(&c, 0, sizeof(c));
-    while ((opt = getopt(argc, argv, "i:o:n:t:ks:A:")) != -1) {
+    memset(&ack_policy, 0, sizeof(ack_policy));
+    ack_policy.jitter = 1;
+    ack_policy.jitter_first = 1;
+    while ((opt = getopt(argc, argv, "i:o:n:t:ks:A:J:F:L:")) != -1) {
         switch (opt) {
         case 'i':
             if (inet_pton(AF_INET, optarg, &c.if_addr) != 1) {
@@ -495,6 +507,9 @@ int main(int argc, char** argv)
         case 'k': keep_running = 1; break;
         case 's': stats_us = (uint64_t)atoi(optarg) * 1000000ull; break;
         case 'A': hash_alg = atoi(optarg); if (picoquic_mcquic_hash_length((uint16_t)hash_alg) == 0) usage(); break;
+        case 'J': ack_policy.jitter = atoi(optarg); break;
+        case 'F': ack_policy.jitter_first = atoi(optarg); break;
+        case 'L': ack_policy.test_drop = atof(optarg); if (ack_policy.test_drop < 0.0 || ack_policy.test_drop >= 1.0) usage(); break;
         default: usage();
         }
     }
@@ -533,7 +548,8 @@ int main(int argc, char** argv)
         (struct sockaddr*)&server, start_time, 0, sni, "h3", 1);
     picoquic_mcquic_set_default_client_params(&params);
     params.hash_algs[0] = (uint16_t)hash_alg;
-    if (cnx == NULL || picoquic_mcquic_enable_client(cnx, &params) != 0) {
+    if (cnx == NULL || picoquic_mcquic_enable_client(cnx, &params) != 0 ||
+        picoquic_mcquic_set_ack_policy(cnx, &ack_policy) != 0) {
         fprintf(stderr, "cannot create the connection\n");
         return 1;
     }
@@ -544,6 +560,9 @@ int main(int argc, char** argv)
         fprintf(stderr, "cannot start the connection\n");
         return 1;
     }
+    mcq_print_time();
+    printf("ack policy: jitter=%d jitter_first=%d test_drop=%.4f\n", ack_policy.jitter, ack_policy.jitter_first,
+        ack_policy.test_drop);
     mcq_print_time();
     printf("connecting to %s:%s from %s\n", argv[optind], argv[optind + 1],
         (c.if_addr.s_addr != 0) ? inet_ntoa(c.if_addr) : "any address");

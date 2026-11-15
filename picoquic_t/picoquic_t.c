@@ -252,6 +252,7 @@ static const picoquic_test_def_t test_table[] = {
     { "mcquic_kat_frames", mcquic_kat_frames_test },
     { "mcquic_kat_encode", mcquic_kat_encode_test },
     { "mcquic_kat_hash_ids", mcquic_kat_hash_ids_test },
+    { "mcquic_kat_ack_policy", mcquic_kat_ack_policy_test },
     { "mcquic_receive", mcquic_receive_test },
     { "new_cnxid", new_cnxid_test },
     { "pacing", pacing_test },

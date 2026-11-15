@@ -43,12 +43,17 @@
 *   -I addr   address of the interface to send the channel on (default: -a)
 *   -g addr   group address (default 232.1.2.3)
 *   -P port   group port (default 4444)
-*   -i ms     publish interval (default 20)
+*   -i us     publish interval in microseconds (default 20000)
 *   -t secs   stop after this many seconds (default 600)
 *   -s secs   statistics interval (default 5)
-*   -H n      maximum hashes per MC_INTEGRITY frame (default 1; capped to fit the path MTU)
-*   -T ms     maximum time a hash waits for its MC_INTEGRITY frame (default 10)
-*   -A id     integrity hash algorithm (1-8, default 1)
+*   -H n      maximum hashes per MC_INTEGRITY frame (default 256; capped to fit the path MTU)
+*   -T ms     maximum time a hash waits for its MC_INTEGRITY frame (default 25; 0 sends each at once)
+*   -A id     integrity hash algorithm (1-8, default 5: SHA-256 truncated to 8 bytes)
+*   -D ms     Max ACK Delay announced in MC_ANNOUNCE, in milliseconds as in draft-08 (default 25)
+*
+* Statistics include, per client, the MC_ACKs received (frames, bytes, ranges
+* per frame) and the unicast packets and bytes sent; with the sender log on
+* stdout, each MC_ACK's arrival is logged ("MC_ACK arrival: client= t_us=").
 */
 
 #ifdef _WINDOWS
@@ -225,14 +230,28 @@ static void mcs_print_stats(picoquic_quic_t* quic, uint64_t start_time)
             (unsigned long long)st.integrity_dropped, (unsigned long long)st.acks_received,
             (unsigned long long)st.largest_acked, nb_cnx, (long)ru.ru_utime.tv_sec, (long)ru.ru_utime.tv_usec / 1000,
             (long)ru.ru_stime.tv_sec, (long)ru.ru_stime.tv_usec / 1000, mcs_rss_kb());
+        for (picoquic_cnx_t* c = picoquic_get_first_cnx(quic); c != NULL; c = picoquic_get_next_cnx(c)) {
+            picoquic_mcquic_client_ack_stats_t as;
+            picoquic_path_quality_t pq;
+            if (picoquic_mcquic_get_client_ack_stats(c, &as) == 0) {
+                picoquic_get_default_path_quality(c, &pq);
+                mcs_print_time();
+                printf("client: index=%llu mc_acks=%llu ack_bytes=%llu ranges_max=%llu ranges_p50=%llu "
+                    "first_ack_us=%llu last_ack_us=%llu unicast_packets_sent=%llu unicast_bytes_sent=%llu unicast_bytes_received=%llu\n",
+                    (unsigned long long)as.client_index, (unsigned long long)as.acks, (unsigned long long)as.ack_bytes,
+                    (unsigned long long)as.ranges_max, (unsigned long long)as.ranges_p50,
+                    (unsigned long long)as.first_ack_time, (unsigned long long)as.last_ack_time,
+                    (unsigned long long)pq.sent, (unsigned long long)pq.bytes_sent, (unsigned long long)pq.bytes_received);
+            }
+        }
         fflush(stdout);
     }
 }
 
 static void usage(void)
 {
-    fprintf(stderr, "usage: mcquic_server -a addr -c cert -k key -f file [-S source] [-I if_addr] [-g group] [-P port] [-i ms] "
-        "[-t secs] [-s secs] [-H n] [-T ms] [-A id] port\n");
+    fprintf(stderr, "usage: mcquic_server -a addr -c cert -k key -f file [-S source] [-I if_addr] [-g group] [-P port] [-i us] "
+        "[-t secs] [-s secs] [-H n] [-T ms] [-A id] [-D ms] port\n");
     exit(1);
 }
 
@@ -303,8 +322,8 @@ int main(int argc, char** argv)
     uint64_t interval_us = 20000;
     uint64_t max_run_us = 600 * 1000000ull;
     uint64_t stats_us = 5 * 1000000ull;
-    size_t batch_max = 1;
-    uint64_t batch_hold_us = 10000;
+    size_t batch_max = 256;
+    uint64_t batch_hold_us = 25000;
     picoquic_packet_loop_param_t param;
     mcs_loop_ctx_t lc;
     mcs_file_t file;
@@ -315,8 +334,9 @@ int main(int argc, char** argv)
     int ret = 0;
 
     picoquic_mcquic_set_default_sender_config(&config);
+    config.hash_alg = 5; /* SHA-256 truncated to 8 bytes */
     memcpy(&group, config.group, 4);
-    while ((opt = getopt(argc, argv, "a:c:k:f:S:I:g:P:i:t:s:H:T:A:")) != -1) {
+    while ((opt = getopt(argc, argv, "a:c:k:f:S:I:g:P:i:t:s:H:T:A:D:")) != -1) {
         switch (opt) {
         case 'a': if (inet_pton(AF_INET, optarg, &addr) != 1) usage(); break;
         case 'c': cert = optarg; break;
@@ -326,12 +346,13 @@ int main(int argc, char** argv)
         case 'I': if (inet_pton(AF_INET, optarg, &if_addr) != 1) usage(); break;
         case 'g': if (inet_pton(AF_INET, optarg, &group) != 1) usage(); break;
         case 'P': config.port = (uint16_t)atoi(optarg); break;
-        case 'i': interval_us = (uint64_t)atoi(optarg) * 1000ull; break;
+        case 'i': interval_us = (uint64_t)atoll(optarg); break;
         case 't': max_run_us = (uint64_t)atoi(optarg) * 1000000ull; break;
         case 's': stats_us = (uint64_t)atoi(optarg) * 1000000ull; break;
         case 'H': batch_max = (size_t)atoi(optarg); break;
         case 'T': batch_hold_us = (uint64_t)atoi(optarg) * 1000ull; break;
         case 'A': config.hash_alg = (uint16_t)atoi(optarg); if (picoquic_mcquic_hash_length(config.hash_alg) == 0) usage(); break;
+        case 'D': config.max_ack_delay_ms = (uint64_t)atoll(optarg); break;
         default: usage();
         }
     }
@@ -352,7 +373,7 @@ int main(int argc, char** argv)
     }
 
     start_time = picoquic_current_time();
-    quic = picoquic_create(16, cert, key, NULL, "h3", mcs_callback, NULL, NULL, NULL, NULL, start_time, NULL, NULL, NULL, 0);
+    quic = picoquic_create(256, cert, key, NULL, "h3", mcs_callback, NULL, NULL, NULL, NULL, start_time, NULL, NULL, NULL, 0);
     memset(&if_sa, 0, sizeof(if_sa));
     if_sa.sin_family = AF_INET;
     if_sa.sin_addr = if_addr;
@@ -374,8 +395,9 @@ int main(int argc, char** argv)
     mcs_print_time();
     printf("channel qmcfile1: source=%s ", inet_ntoa(source));
     printf("group=%s:%u ", inet_ntoa(group), config.port);
-    printf("interface=%s interval=%llums hash_alg=%u hashes_per_integrity=%zu max_hold=%llums\n", inet_ntoa(if_addr),
-        (unsigned long long)(interval_us / 1000), config.hash_alg, batch_max, (unsigned long long)(batch_hold_us / 1000));
+    printf("interface=%s interval=%lluus hash_alg=%u hashes_per_integrity=%zu max_hold=%llums max_ack_delay=%llums\n",
+        inet_ntoa(if_addr), (unsigned long long)interval_us, config.hash_alg, batch_max,
+        (unsigned long long)(batch_hold_us / 1000), (unsigned long long)config.max_ack_delay_ms);
     fflush(stdout);
 
     memset(&param, 0, sizeof(param));

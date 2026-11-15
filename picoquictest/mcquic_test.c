@@ -453,6 +453,102 @@ int mcquic_kat_frames_test(void)
 /* Integrity hash algorithms by registry ID, as quiche maps them: 1 is SHA-256,
  * 5 is SHA-256 truncated to 8 bytes, 6 to 4 bytes. The client advertises the
  * chosen one, and an MC_INTEGRITY batch of such hashes decodes by count. */
+/* MC_ANNOUNCE with a 2 s Max ACK Delay: the frame above with the last field,
+ * Max ACK Delay in milliseconds (draft-08 10.1, quiche's max_ack_delay_ms), as
+ * the 2-byte varint 2000 */
+static const uint8_t mcquic_kat_frame_announce_2s[] = {
+    0x8f, 0xf3, 0xe8, 0x11, 0x08, 0x71, 0x6d, 0x63, 0x66, 0x69, 0x6c, 0x65, 0x31, 0xc0, 0x00, 0x02,
+    0x01, 0xe8, 0x01, 0x02, 0x03, 0x11, 0x5c, 0x13, 0x01, 0x10, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa,
+    0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0x13, 0x01, 0x00, 0x01, 0x44, 0x00,
+    0x47, 0xd0
+};
+/* MC_ACK with many ranges, laid out by hand from draft-08 10.6 / RFC 9000 19.3:
+ * type 0xff3e806, ID length 8, "qmcfile1", Largest Acknowledged 10000 (0x6710),
+ * ACK Delay 0, ACK Range Count 300 (0x412c), First ACK Range 0, then 300 pairs:
+ * Gap 0 and ACK Range Length 0 for the first 299 (every other packet missing),
+ * then Gap 100 (0x4064) and Length 1000 (0x43e8). */
+#define MCQUIC_KAT_MANY_RANGES 300
+static size_t mcquic_kat_ack_many(uint8_t* wire, size_t wire_max)
+{
+    static const uint8_t head[] = {
+        0x8f, 0xf3, 0xe8, 0x06, 0x08, 0x71, 0x6d, 0x63, 0x66, 0x69, 0x6c, 0x65, 0x31, 0x67, 0x10, 0x00,
+        0x41, 0x2c, 0x00
+    };
+    size_t l = sizeof(head);
+
+    if (wire_max < sizeof(head) + 2 * (MCQUIC_KAT_MANY_RANGES - 1) + 4) {
+        return 0;
+    }
+    memcpy(wire, head, sizeof(head));
+    for (int i = 0; i < MCQUIC_KAT_MANY_RANGES - 1; i++) {
+        wire[l++] = 0x00;
+        wire[l++] = 0x00;
+    }
+    wire[l++] = 0x40;
+    wire[l++] = 0x64;
+    wire[l++] = 0x43;
+    wire[l++] = 0xe8;
+    return l;
+}
+
+static int mcquic_kat_encode_frame(const picoquic_mcquic_frame_t* f, const uint8_t* expected, size_t expected_length);
+
+int mcquic_kat_ack_policy_test(void)
+{
+    picoquic_mcquic_frame_t f;
+    picoquic_mcquic_sender_config_t config;
+    uint8_t wire[1024];
+    uint8_t buffer[1024];
+    uint8_t* encoded;
+    size_t wire_length;
+    uint64_t frame_type = 0;
+    const uint8_t* bytes;
+    uint64_t pairs[2 * 8];
+
+    /* MC_ANNOUNCE, Max ACK Delay 2000 ms: decode, re-encode, and encode from a sender configuration */
+    MCQUIC_TEST_CHECK(mcquic_kat_frame_roundtrip(mcquic_kat_frame_announce_2s, sizeof(mcquic_kat_frame_announce_2s), 0, &f) == 0);
+    MCQUIC_TEST_CHECK(f.frame_type == PICOQUIC_MCQUIC_FRAME_ANNOUNCE_V4 && f.u.announce.max_ack_delay_ms == 2000 &&
+        f.u.announce.max_rate_kibps == 1024 && f.u.announce.hash_alg == 1);
+    picoquic_mcquic_set_default_sender_config(&config);
+    config.source[0] = 192;
+    config.source[1] = 0;
+    config.source[2] = 2;
+    config.source[3] = 1;
+    config.max_ack_delay_ms = 2000;
+    picoquic_mcquic_sender_frame(&config, PICOQUIC_MCQUIC_FRAME_ANNOUNCE_V4, &f);
+    MCQUIC_TEST_CHECK(mcquic_kat_encode_frame(&f, mcquic_kat_frame_announce_2s, sizeof(mcquic_kat_frame_announce_2s)) == 0);
+
+    /* MC_ACK with 300 ranges (301 counting the first): decode, check, re-encode identically */
+    MCQUIC_TEST_CHECK((wire_length = mcquic_kat_ack_many(wire, sizeof(wire))) == 19 + 2 * 299 + 4);
+    bytes = picoquic_frames_varint_decode(wire, wire + wire_length, &frame_type);
+    MCQUIC_TEST_CHECK(bytes != NULL && frame_type == PICOQUIC_MCQUIC_FRAME_ACK);
+    MCQUIC_TEST_CHECK(picoquic_mcquic_frame_decode(bytes, wire + wire_length, frame_type, 0, &f) == wire + wire_length);
+    MCQUIC_TEST_CHECK(f.u.ack.largest == 10000 && f.u.ack.ack_delay == 0 && f.u.ack.range_count == MCQUIC_KAT_MANY_RANGES &&
+        f.u.ack.first_range == 0 && f.u.ack.ranges_length == 2 * 299 + 4);
+    encoded = picoquic_mcquic_frame_encode(buffer, buffer + sizeof(buffer), &f);
+    MCQUIC_TEST_CHECK(encoded != NULL && mcquic_kat_bytes_equal(buffer, encoded - buffer, wire, wire_length));
+    /* Truncated anywhere inside the ranges, it does not decode */
+    for (size_t k = 1; k <= 2 * 299 + 4; k += 37) {
+        MCQUIC_TEST_CHECK(picoquic_mcquic_frame_decode(bytes, wire + wire_length - k, frame_type, 0, &f) == NULL);
+    }
+    /* Encoding into a buffer one byte short fails */
+    MCQUIC_TEST_CHECK(picoquic_mcquic_frame_decode(bytes, wire + wire_length, frame_type, 0, &f) == wire + wire_length);
+    MCQUIC_TEST_CHECK(picoquic_mcquic_frame_encode(buffer, buffer + wire_length - 1, &f) == NULL);
+
+    /* Ranges that fit a byte budget, newest first: 1-byte gap and length per pair,
+     * then a pair with a 2-byte gap */
+    for (int i = 0; i < 8; i++) {
+        pairs[2 * i] = (i == 5) ? 100 : 0;
+        pairs[2 * i + 1] = 0;
+    }
+    MCQUIC_TEST_CHECK(picoquic_mcquic_ack_ranges_fit(10, pairs, 8) == 5);
+    MCQUIC_TEST_CHECK(picoquic_mcquic_ack_ranges_fit(12, pairs, 8) == 5);
+    MCQUIC_TEST_CHECK(picoquic_mcquic_ack_ranges_fit(13, pairs, 8) == 6);
+    MCQUIC_TEST_CHECK(picoquic_mcquic_ack_ranges_fit(100, pairs, 8) == 8);
+    MCQUIC_TEST_CHECK(picoquic_mcquic_ack_ranges_fit(0, pairs, 8) == 0);
+    return 0;
+}
+
 int mcquic_kat_hash_ids_test(void)
 {
     static const uint16_t ids[3] = { PICOQUIC_MCQUIC_HASH_SHA256, PICOQUIC_MCQUIC_HASH_SHA256_64, PICOQUIC_MCQUIC_HASH_SHA256_32 };
@@ -692,6 +788,13 @@ int mcquic_receive_test(void)
             (struct sockaddr*)&server, now, 0, "test.com", "h3", 1)) == NULL ||
         picoquic_mcquic_enable_client(cnx, NULL) != 0) {
         ret = -1;
+    }
+    if (ret == 0) {
+        /* MC_ACKs as the QUICast client sends them: the first at once, no jitter */
+        picoquic_mcquic_ack_policy_t policy = { 0, 0, 0.0 };
+        if (picoquic_mcquic_set_ack_policy(cnx, &policy) != 0) {
+            ret = -1;
+        }
     }
     if (ret == 0) {
         picoquic_set_callback(cnx, mcquic_receive_test_callback, &test_ctx);
