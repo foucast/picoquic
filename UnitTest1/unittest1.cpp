@@ -960,6 +960,13 @@ namespace UnitTest1
             Assert::AreEqual(ret, 0);
         }
 
+        TEST_METHOD(mcquic_server_hash)
+        {
+            int ret = mcquic_server_hash_test();
+
+            Assert::AreEqual(ret, 0);
+        }
+
         TEST_METHOD(mcquic_receive)
         {
             int ret = mcquic_receive_test();

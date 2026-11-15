@@ -761,6 +761,178 @@ static int mcquic_receive_test_frame(picoquic_cnx_t* cnx, const uint8_t* wire, s
     return (bytes != NULL && picoquic_mcquic_decode_control_frame(cnx, bytes, wire + wire_length, frame_type, now) == wire + wire_length) ? 0 : -1;
 }
 
+/* Takes the first queued misc frame and decodes it as an MC_* frame */
+static int mcquic_server_hash_pop(picoquic_cnx_t* cnx, uint8_t* copy, size_t copy_max, size_t hash_length,
+    picoquic_mcquic_frame_t* f)
+{
+    picoquic_misc_frame_header_t* misc = cnx->first_misc_frame;
+    uint64_t frame_type = 0;
+    const uint8_t* bytes;
+    int ret = -1;
+
+    if (misc != NULL) {
+        if (misc->length <= copy_max) {
+            memcpy(copy, (uint8_t*)misc + sizeof(picoquic_misc_frame_header_t), misc->length);
+            if ((bytes = picoquic_frames_varint_decode(copy, copy + misc->length, &frame_type)) != NULL &&
+                picoquic_mcquic_frame_decode(bytes, copy + misc->length, frame_type, hash_length, f) == copy + misc->length) {
+                ret = 0;
+            }
+        }
+        picoquic_delete_misc_or_dg(&cnx->first_misc_frame, &cnx->last_misc_frame, misc);
+    }
+    return ret;
+}
+
+/* Sets up a server connection whose client sent multicast_client_params with
+ * the given hash list, and calls picoquic_mcquic_server_start() */
+static picoquic_cnx_t* mcquic_server_hash_cnx(picoquic_quic_t* quic, const uint16_t* algs, size_t nb_algs, uint64_t now)
+{
+    static uint16_t port = 4433;
+    picoquic_connection_id_t icid;
+    struct sockaddr_in peer;
+    picoquic_mcquic_client_params_t params;
+    uint8_t tp[64];
+    uint8_t* end;
+    picoquic_cnx_t* cnx;
+
+    memset(&peer, 0, sizeof(peer));
+    peer.sin_family = AF_INET;
+    peer.sin_port = htons(port++);
+    peer.sin_addr.s_addr = htonl(0xc6336401); /* 198.51.100.1 */
+    /* Each connection gets its own initial connection ID */
+    memset(&icid, 0, sizeof(icid));
+    icid.id_len = 8;
+    icid.id[0] = (uint8_t)port;
+    if ((cnx = picoquic_create_cnx(quic, icid, picoquic_null_connection_id,
+        (struct sockaddr*)&peer, now, 0, NULL, "h3", 0)) == NULL) {
+        return NULL;
+    }
+    picoquic_mcquic_set_default_client_params(&params);
+    params.nb_hash_algs = nb_algs;
+    memcpy(params.hash_algs, algs, nb_algs * sizeof(uint16_t));
+    if ((end = picoquic_mcquic_client_params_encode(tp, tp + sizeof(tp), &params)) == NULL ||
+        picoquic_mcquic_receive_client_params(cnx, tp, end - tp) != 0 ||
+        picoquic_mcquic_server_start(cnx) != 0) {
+        return NULL;
+    }
+    return cnx;
+}
+
+/* The server announces, per connection, a hash the client listed (draft-08 3:
+ * it MUST NOT announce an algorithm the client did not list) */
+int mcquic_server_hash_test(void)
+{
+    static const uint16_t only1[] = { PICOQUIC_MCQUIC_HASH_SHA256 };
+    static const uint16_t five_one[] = { PICOQUIC_MCQUIC_HASH_SHA256_64, PICOQUIC_MCQUIC_HASH_SHA256 };
+    static const uint16_t one_five[] = { PICOQUIC_MCQUIC_HASH_SHA256, PICOQUIC_MCQUIC_HASH_SHA256_64 };
+    static const uint16_t two_one[] = { 2, PICOQUIC_MCQUIC_HASH_SHA256 };
+    static const uint16_t unknown[] = { 99 };
+    uint64_t now = 0;
+    picoquic_quic_t* quic = picoquic_create(8, NULL, NULL, NULL, "h3", NULL, NULL, NULL, NULL, NULL, now, &now, NULL, NULL, 0);
+    picoquic_mcquic_sender_config_t config;
+    picoquic_mcquic_client_params_t params;
+    picoquic_mcquic_client_ack_stats_t as;
+    picoquic_mcquic_frame_t f;
+    picoquic_cnx_t* cnx = NULL;
+    uint8_t copy[MCQUIC_KAT_PLAINTEXT1115_LENGTH + 512];
+    uint8_t packet[2048];
+    uint8_t hash[PICOQUIC_MCQUIC_HASH_MAX];
+    static const uint8_t payload[100] = { 0 };
+    uint64_t pn = 0;
+    size_t length;
+    int ret = 0;
+
+    /* The choice itself */
+    picoquic_mcquic_set_default_client_params(&params);
+    params.nb_hash_algs = 1;
+    params.hash_algs[0] = 1;
+    if (picoquic_mcquic_choose_hash_alg(5, &params) != 1) {
+        ret = -1;
+    }
+    params.nb_hash_algs = 2;
+    memcpy(params.hash_algs, one_five, sizeof(one_five));
+    if (ret == 0 && picoquic_mcquic_choose_hash_alg(5, &params) != 5) {
+        ret = -1; /* the configured hash wins when listed, whatever its rank */
+    }
+    memcpy(params.hash_algs, two_one, sizeof(two_one));
+    if (ret == 0 && picoquic_mcquic_choose_hash_alg(5, &params) != 2) {
+        ret = -1; /* else the client's first supported choice */
+    }
+    params.nb_hash_algs = 1;
+    params.hash_algs[0] = 99;
+    if (ret == 0 && picoquic_mcquic_choose_hash_alg(5, &params) != 0) {
+        ret = -1;
+    }
+    params.nb_hash_algs = 0;
+    if (ret == 0 && picoquic_mcquic_choose_hash_alg(5, &params) != 0) {
+        ret = -1;
+    }
+
+    /* A sender configured with hash 5 */
+    picoquic_mcquic_set_default_sender_config(&config);
+    config.source[0] = 192;
+    config.source[1] = 0;
+    config.source[2] = 2;
+    config.source[3] = 1;
+    config.hash_alg = PICOQUIC_MCQUIC_HASH_SHA256_64;
+    if (ret == 0 && (quic == NULL || picoquic_mcquic_sender_create(quic, &config) != 0)) {
+        ret = -1;
+    }
+
+    /* Client lists only 1: MC_ANNOUNCE says 1, and its MC_INTEGRITY carries a
+     * 32-byte SHA-256 of the channel packet */
+    if (ret == 0 && ((cnx = mcquic_server_hash_cnx(quic, only1, 1, now)) == NULL ||
+        picoquic_mcquic_get_client_ack_stats(cnx, &as) != 0 || as.hash_alg != 1 ||
+        mcquic_server_hash_pop(cnx, copy, sizeof(copy), 0, &f) != 0 ||
+        f.frame_type != PICOQUIC_MCQUIC_FRAME_ANNOUNCE_V4 || f.u.announce.hash_alg != 1 ||
+        mcquic_server_hash_pop(cnx, copy, sizeof(copy), 0, &f) != 0 || f.frame_type != PICOQUIC_MCQUIC_FRAME_KEY)) {
+        DBG_PRINTF("%s", "hash 1 announce");
+        ret = -1;
+    }
+    if (ret == 0) {
+        /* The client reports Joined; the connection is ready and live */
+        if (mcquic_receive_test_frame(cnx, mcquic_kat_frame_state, sizeof(mcquic_kat_frame_state), now) != 0) {
+            DBG_PRINTF("%s", "state joined");
+            ret = -1;
+        }
+        else {
+            while (cnx->first_misc_frame != NULL) {
+                picoquic_delete_misc_or_dg(&cnx->first_misc_frame, &cnx->last_misc_frame, cnx->first_misc_frame);
+            }
+            cnx->cnx_state = picoquic_state_ready;
+            cnx->latest_receive_time = now;
+        }
+    }
+    if (ret == 0 && ((length = picoquic_mcquic_sender_prepare(quic, payload, sizeof(payload), now, packet, sizeof(packet), &pn)) == 0 ||
+        picoquic_mcquic_integrity_hash(PICOQUIC_MCQUIC_HASH_SHA256, packet, length, hash, sizeof(hash)) != 0 ||
+        mcquic_server_hash_pop(cnx, copy, sizeof(copy), 32, &f) != 0 ||
+        f.frame_type != PICOQUIC_MCQUIC_FRAME_INTEGRITY_LEN || f.u.integrity.packet_number_start != pn ||
+        f.u.integrity.hash_count != 1 || f.u.integrity.hashes_length != 32 || memcmp(f.u.integrity.hashes, hash, 32) != 0)) {
+        DBG_PRINTF("%s", "hash 1 integrity");
+        ret = -1;
+    }
+
+    /* Client lists 5 then 1: the configured 5 */
+    if (ret == 0 && ((cnx = mcquic_server_hash_cnx(quic, five_one, 2, now)) == NULL ||
+        picoquic_mcquic_get_client_ack_stats(cnx, &as) != 0 || as.hash_alg != 5 ||
+        mcquic_server_hash_pop(cnx, copy, sizeof(copy), 0, &f) != 0 || f.u.announce.hash_alg != 5)) {
+        DBG_PRINTF("%s", "hash 5 announce");
+        ret = -1;
+    }
+
+    /* Client lists nothing this sender supports: no MC_ANNOUNCE at all */
+    if (ret == 0 && ((cnx = mcquic_server_hash_cnx(quic, unknown, 1, now)) == NULL ||
+        picoquic_mcquic_get_client_ack_stats(cnx, &as) != 0 || as.hash_alg != 0 || cnx->first_misc_frame != NULL)) {
+        DBG_PRINTF("%s", "no supported hash");
+        ret = -1;
+    }
+
+    if (quic != NULL) {
+        picoquic_free(quic);
+    }
+    return ret;
+}
+
 int mcquic_receive_test(void)
 {
     uint64_t now = 0;

@@ -333,6 +333,7 @@ typedef struct st_picoquic_mcquic_sender_config_t {
 /* MC_ACKs received from one client (server side) */
 typedef struct st_picoquic_mcquic_client_ack_stats_t {
     uint64_t client_index; /* order in which the sender saw the connections, from 1 */
+    uint16_t hash_alg; /* integrity hash announced to this client, 0 if not announced */
     uint64_t acks;
     uint64_t ack_bytes; /* MC_ACK frame bytes, type included */
     uint64_t ranges_max; /* ACK ranges per MC_ACK, First ACK Range counted as one */
@@ -361,7 +362,14 @@ int picoquic_mcquic_sender_create(picoquic_quic_t* quic, const picoquic_mcquic_s
 void picoquic_mcquic_sender_delete(picoquic_quic_t* quic);
 void picoquic_mcquic_sender_set_log(picoquic_quic_t* quic, FILE* f);
 int picoquic_mcquic_sender_get_stats(picoquic_quic_t* quic, picoquic_mcquic_sender_stats_t* stats);
+/* Announces the channel to a client. The integrity hash is chosen per
+ * connection, since MC_INTEGRITY goes over each client's unicast connection:
+ * the configured hash if the client's multicast_client_params lists it, else
+ * the first listed hash this sender supports. draft-08 3: the server MUST NOT
+ * send an MC_ANNOUNCE for a channel using an algorithm the client did not
+ * list, so a client that lists none gets no MC_ANNOUNCE (logged). */
 int picoquic_mcquic_server_start(picoquic_cnx_t* cnx);
+uint16_t picoquic_mcquic_choose_hash_alg(uint16_t configured, const picoquic_mcquic_client_params_t* params);
 int picoquic_mcquic_get_client_ack_stats(picoquic_cnx_t* cnx, picoquic_mcquic_client_ack_stats_t* stats);
 /* MC_INTEGRITY batching: per client, one frame carries up to max_hashes hashes
  * (capped so the frame fits the path MTU), sent when max_hashes are pending or

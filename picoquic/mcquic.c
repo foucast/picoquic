@@ -144,6 +144,9 @@ typedef struct st_picoquic_mcquic_ctx_t {
     uint64_t acks_received;
     uint64_t largest_acked;
     picoquic_mcquic_ack_policy_t ack_policy;
+    /* Server side: integrity hash announced to this client */
+    uint16_t hash_alg;
+    size_t hash_length;
     /* Server side: MC_ACKs from this client */
     uint64_t client_index;
     uint64_t ack_bytes;
@@ -1942,6 +1945,7 @@ int picoquic_mcquic_get_client_ack_stats(picoquic_cnx_t* cnx, picoquic_mcquic_cl
     }
     memset(stats, 0, sizeof(*stats));
     stats->client_index = ctx->client_index;
+    stats->hash_alg = ctx->hash_alg;
     stats->acks = ctx->acks_received;
     stats->ack_bytes = ctx->ack_bytes;
     stats->first_ack_time = ctx->ack_first_time;
@@ -1955,6 +1959,30 @@ int picoquic_mcquic_get_client_ack_stats(picoquic_cnx_t* cnx, picoquic_mcquic_cl
             stats->ranges_p50 = i;
         }
         seen += ctx->ack_ranges_hist[i];
+    }
+    return 0;
+}
+
+static int mcquic_hash_supported(uint16_t hash_alg)
+{
+    uint8_t hash[PICOQUIC_MCQUIC_HASH_MAX];
+    static const uint8_t probe[1] = { 0 };
+
+    /* Id 8 depends on the AEGIS-256 suite being registered: try it */
+    return picoquic_mcquic_hash_length(hash_alg) != 0 &&
+        picoquic_mcquic_integrity_hash(hash_alg, probe, sizeof(probe), hash, sizeof(hash)) == 0;
+}
+
+uint16_t picoquic_mcquic_choose_hash_alg(uint16_t configured, const picoquic_mcquic_client_params_t* params)
+{
+    if (mcquic_param_contains(params->hash_algs, params->nb_hash_algs, configured) && mcquic_hash_supported(configured)) {
+        return configured;
+    }
+    /* The client's list is in its order of preference (draft-08 3) */
+    for (size_t i = 0; i < params->nb_hash_algs; i++) {
+        if (mcquic_hash_supported(params->hash_algs[i])) {
+            return params->hash_algs[i];
+        }
     }
     return 0;
 }
@@ -1975,13 +2003,25 @@ int picoquic_mcquic_server_start(picoquic_cnx_t* cnx)
         return 0;
     }
     ctx->announced = 1;
+    if ((ctx->hash_alg = picoquic_mcquic_choose_hash_alg(sender->config.hash_alg, &ctx->params)) == 0) {
+        char list[8 * PICOQUIC_MCQUIC_ALGS_MAX + 1];
+        size_t l = 0;
+        list[0] = 0;
+        for (size_t i = 0; i < ctx->params.nb_hash_algs && l + 8 < sizeof(list); i++) {
+            l += (size_t)snprintf(list + l, sizeof(list) - l, "%s%u", (i == 0) ? "" : ",", ctx->params.hash_algs[i]);
+        }
+        mcquic_log(ctx, "client lists no supported integrity hash (%s); not announcing", list);
+        return 0;
+    }
+    ctx->hash_length = picoquic_mcquic_hash_length(ctx->hash_alg);
     picoquic_mcquic_sender_frame(&sender->config, PICOQUIC_MCQUIC_FRAME_ANNOUNCE_V4, &f);
+    f.u.announce.hash_alg = ctx->hash_alg;
     if ((ret = mcquic_queue_frame(cnx, &f)) == 0) {
         picoquic_mcquic_sender_frame(&sender->config, PICOQUIC_MCQUIC_FRAME_KEY, &f);
         ret = mcquic_queue_frame(cnx, &f);
     }
-    mcquic_log(ctx, "MC_ANNOUNCE and MC_KEY sent: channel=%s key_sequence=%llu", mcquic_id_hex(&sender->config.channel_id, idh),
-        (unsigned long long)sender->config.key_sequence);
+    mcquic_log(ctx, "MC_ANNOUNCE and MC_KEY sent: channel=%s key_sequence=%llu hash=%u", mcquic_id_hex(&sender->config.channel_id, idh),
+        (unsigned long long)sender->config.key_sequence, ctx->hash_alg);
     return ret;
 }
 
@@ -2083,14 +2123,14 @@ static void mcquic_drop_queued_integrity(picoquic_cnx_t* cnx, picoquic_mcquic_ct
 
 /* Hashes per MC_INTEGRITY: the configured maximum, capped so that the frame fits
  * in a 1-RTT packet on the connection's path */
-static size_t mcquic_batch_limit(picoquic_cnx_t* cnx, picoquic_mcquic_sender_t* sender)
+static size_t mcquic_batch_limit(picoquic_cnx_t* cnx, picoquic_mcquic_sender_t* sender, size_t hash_length)
 {
     size_t mtu = (cnx->path != NULL && cnx->path[0] != NULL && cnx->path[0]->send_mtu > 0) ?
         cnx->path[0]->send_mtu : PICOQUIC_INITIAL_MTU_IPV4;
     /* Short header (1 + 20-byte CID + 4-byte PN), AEAD tag, then the frame header:
      * type (4), channel ID (1 + 20), packet number start (8), count (8) */
     size_t overhead = 1 + 20 + 4 + 16 + 4 + 1 + PICOQUIC_MCQUIC_CHANNEL_ID_MAX + 8 + 8;
-    size_t cap = (mtu > overhead) ? (mtu - overhead) / sender->hash_length : 1;
+    size_t cap = (mtu > overhead) ? (mtu - overhead) / hash_length : 1;
     size_t limit = (sender->batch_max < cap) ? sender->batch_max : cap;
 
     if (limit > MCQUIC_INTEGRITY_BATCH_MAX) {
@@ -2115,7 +2155,7 @@ static void mcquic_flush_batch(picoquic_cnx_t* cnx, picoquic_mcquic_ctx_t* ctx, 
     f.u.integrity.has_count = 1;
     f.u.integrity.hash_count = ctx->batch_count;
     f.u.integrity.hashes = ctx->batch_hashes;
-    f.u.integrity.hashes_length = ctx->batch_count * sender->hash_length;
+    f.u.integrity.hashes_length = ctx->batch_count * ctx->hash_length;
     if ((bytes = picoquic_mcquic_frame_encode(buffer, buffer + sizeof(buffer), &f)) != NULL &&
         picoquic_queue_misc_frame(cnx, buffer, bytes - buffer, 0, picoquic_packet_context_application) == 0) {
         sender->stats.integrity_sent += ctx->batch_count;
@@ -2176,6 +2216,8 @@ size_t picoquic_mcquic_sender_prepare(picoquic_quic_t* quic, const uint8_t* payl
     uint8_t* p;
     size_t length;
     uint8_t hash[PICOQUIC_MCQUIC_HASH_MAX];
+    uint8_t alg_hash[PICOQUIC_MCQUIC_ALGS_MAX + 1][PICOQUIC_MCQUIC_HASH_MAX];
+    int alg_done[PICOQUIC_MCQUIC_ALGS_MAX + 1];
 
     if (sender == NULL || payload_length + 16 > sizeof(plaintext)) {
         return 0;
@@ -2195,7 +2237,13 @@ size_t picoquic_mcquic_sender_prepare(picoquic_quic_t* quic, const uint8_t* payl
     *pn = sender->next_pn++;
     sender->stats.packets_sent++;
 
-    /* Each joined connection gets the hash in its MC_INTEGRITY batch */
+    /* Each joined connection gets the hash, in the algorithm announced to it, in
+     * its MC_INTEGRITY batch; each other algorithm is computed once per packet */
+    memset(alg_done, 0, sizeof(alg_done));
+    if (sender->config.hash_alg <= PICOQUIC_MCQUIC_ALGS_MAX) {
+        memcpy(alg_hash[sender->config.hash_alg], hash, sender->hash_length);
+        alg_done[sender->config.hash_alg] = 1;
+    }
     for (picoquic_cnx_t* cnx = picoquic_get_first_cnx(quic); cnx != NULL; cnx = picoquic_get_next_cnx(cnx)) {
         picoquic_mcquic_ctx_t* ctx = mcquic_ctx(cnx);
         if (ctx == NULL || !ctx->is_server || !ctx->sender_joined) {
@@ -2214,6 +2262,15 @@ size_t picoquic_mcquic_sender_prepare(picoquic_quic_t* quic, const uint8_t* payl
             continue;
         }
         ctx->sender_joined = 1;
+        if (ctx->hash_alg == 0 || ctx->hash_alg > PICOQUIC_MCQUIC_ALGS_MAX) {
+            continue;
+        }
+        if (!alg_done[ctx->hash_alg]) {
+            if (picoquic_mcquic_integrity_hash(ctx->hash_alg, bytes, length, alg_hash[ctx->hash_alg], PICOQUIC_MCQUIC_HASH_MAX) != 0) {
+                continue;
+            }
+            alg_done[ctx->hash_alg] = 1;
+        }
         if (ctx->batch_hashes == NULL &&
             (ctx->batch_hashes = (uint8_t*)malloc(MCQUIC_INTEGRITY_BATCH_MAX * PICOQUIC_MCQUIC_HASH_MAX)) == NULL) {
             continue;
@@ -2225,9 +2282,9 @@ size_t picoquic_mcquic_sender_prepare(picoquic_quic_t* quic, const uint8_t* payl
             ctx->batch_pn_start = *pn;
             ctx->batch_oldest = current_time;
         }
-        memcpy(ctx->batch_hashes + ctx->batch_count * sender->hash_length, hash, sender->hash_length);
+        memcpy(ctx->batch_hashes + ctx->batch_count * ctx->hash_length, alg_hash[ctx->hash_alg], ctx->hash_length);
         ctx->batch_count++;
-        if (ctx->batch_count >= mcquic_batch_limit(cnx, sender)) {
+        if (ctx->batch_count >= mcquic_batch_limit(cnx, sender, ctx->hash_length)) {
             mcquic_flush_batch(cnx, ctx, sender);
         }
     }

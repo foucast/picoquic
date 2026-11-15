@@ -240,9 +240,9 @@ static void mcs_print_stats(picoquic_quic_t* quic, uint64_t start_time)
             if (picoquic_mcquic_get_client_ack_stats(c, &as) == 0) {
                 picoquic_get_default_path_quality(c, &pq);
                 mcs_print_time();
-                printf("client: index=%llu mc_acks=%llu ack_bytes=%llu ranges_max=%llu ranges_p50=%llu "
+                printf("client: index=%llu hash=%u mc_acks=%llu ack_bytes=%llu ranges_max=%llu ranges_p50=%llu "
                     "first_ack_us=%llu last_ack_us=%llu unicast_packets_sent=%llu unicast_bytes_sent=%llu unicast_bytes_received=%llu\n",
-                    (unsigned long long)as.client_index, (unsigned long long)as.acks, (unsigned long long)as.ack_bytes,
+                    (unsigned long long)as.client_index, as.hash_alg, (unsigned long long)as.acks, (unsigned long long)as.ack_bytes,
                     (unsigned long long)as.ranges_max, (unsigned long long)as.ranges_p50,
                     (unsigned long long)as.first_ack_time, (unsigned long long)as.last_ack_time,
                     (unsigned long long)pq.sent, (unsigned long long)pq.bytes_sent, (unsigned long long)pq.bytes_received);

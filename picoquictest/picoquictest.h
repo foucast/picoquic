@@ -307,6 +307,7 @@ int mcquic_kat_frames_test(void);
 int mcquic_kat_encode_test(void);
 int mcquic_kat_hash_ids_test(void);
 int mcquic_kat_ack_policy_test(void);
+int mcquic_server_hash_test(void);
 int mcquic_receive_test(void);
 int new_cnxid_test(void);
 int transmit_cnxid_test(void);
