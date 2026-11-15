@@ -1,5 +1,6 @@
 /*
 * Copyright (c) 2026 Marc E. Fiuczynski
+* Based on QUICast by Max Franke.
 * All rights reserved.
 *
 * Permission to use, copy, modify, and distribute this software for any
