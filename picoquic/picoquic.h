@@ -427,7 +427,10 @@ typedef enum {
     picoquic_callback_stream_released, /* Stream fully retired: bytes=NULL, len=0,
                                        * stream_ctx = the app_stream_ctx the app set;
                                        * picoquic will not call back with this stream_ctx again. */
-    picoquic_callback_scone_indication /* Received a scone indication of the long term incoming rate */
+    picoquic_callback_scone_indication, /* Received a scone indication of the long term incoming rate */
+    picoquic_callback_mc_join, /* Multicast: server asks to join a channel, see mcquic.h */
+    picoquic_callback_mc_leave, /* Multicast: a joined channel was left or retired */
+    picoquic_callback_mc_datagram /* Multicast: authenticated DATAGRAM frame from a channel */
 } picoquic_call_back_event_t;
 
 typedef struct st_picoquic_tp_preferred_address_t {

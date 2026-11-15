@@ -51,6 +51,7 @@ typedef struct st_picoquic_socket_ctx_t {
     unsigned int is_started : 1;
     unsigned int supports_udp_send_coalesced : 1;
     unsigned int supports_udp_recv_coalesced : 1;
+    unsigned int is_multicast : 1; /* A multicast channel socket, owned by mcquic_loop.c */
     struct sockaddr_storage bound_addr; /* Local address of the socket after bind, as reported by getsockname */
     /* Receive data buffer and fields */
     size_t recv_buffer_size;

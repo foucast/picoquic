@@ -102,6 +102,8 @@ set(PICOQUIC_LIBRARY_FILES
     picoquic/intformat.c
     picoquic/logger.c
     picoquic/logwriter.c
+    picoquic/mcquic.c
+    picoquic/mcquic_loop.c
     picoquic/loss_recovery.c
     picoquic/newreno.c
     picoquic/pacing.c
@@ -144,6 +146,8 @@ set(PICOQUIC_LIBRARY_FILES
 
 set(PICOQUIC_CORE_HEADERS
      picoquic/picoquic.h
+     picoquic/mcquic.h
+     picoquic/mcquic_loop.h
      picoquic/picosocks.h
      picoquic/picoquic_utils.h
      picoquic/picoquic_packet_loop.h
@@ -227,6 +231,7 @@ set(PICOQUIC_TEST_LIBRARY_FILES
     picoquictest/mbedtls_test.c
     picoquictest/mediatest.c
     picoquictest/memlog_test.c
+    picoquictest/mcquic_test.c
     picoquictest/minicrypto_test.c
     picoquictest/multipath_test.c
     picoquictest/netperf_test.c
@@ -758,6 +763,18 @@ if(BUILD_TESTING AND picoquic_BUILD_TESTS)
     target_link_libraries(picoquic_sample PRIVATE picoquic-log picoquic-core)
     target_include_directories(picoquic_sample PRIVATE loglib picoquic)
     set_picoquic_compile_settings(picoquic_sample)
+
+    if(NOT WIN32)
+        add_executable(mcquic_client mcquic_client/mcquic_client.c)
+        target_link_libraries(mcquic_client PRIVATE picoquic-core)
+        target_include_directories(mcquic_client PRIVATE picoquic ${PTLS_INCLUDE_DIRS})
+        set_picoquic_compile_settings(mcquic_client)
+
+        add_executable(mcquic_server mcquic_server/mcquic_server.c)
+        target_link_libraries(mcquic_server PRIVATE picoquic-core)
+        target_include_directories(mcquic_server PRIVATE picoquic ${PTLS_INCLUDE_DIRS})
+        set_picoquic_compile_settings(mcquic_server)
+    endif()
 
     add_test(NAME picoquic_ct
              COMMAND picoquic_ct -S ${PROJECT_SOURCE_DIR} -n -r)

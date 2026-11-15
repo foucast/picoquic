@@ -26,6 +26,8 @@
 #include "picoquic_utils.h"
 #include "picoquic_unified_log.h"
 #include "tls_api.h"
+#include "mcquic.h"
+#include "mcquic_loop.h"
 #include <stdlib.h>
 #include <string.h>
 #ifndef _WINDOWS
@@ -1107,6 +1109,8 @@ void picoquic_free(picoquic_quic_t* quic)
         while (quic->cnx_list != NULL) {
             picoquic_delete_cnx(quic->cnx_list);
         }
+        picoquic_mcquic_loop_delete(quic);
+        picoquic_mcquic_sender_delete(quic);
 
         /* Delete ECH context if it was created */
         picoquic_release_quic_ech_ctx(quic);
@@ -5050,6 +5054,8 @@ void picoquic_delete_cnx(picoquic_cnx_t* cnx)
             picoquic_reset_packet_context(cnx, &cnx->pkt_ctx[pc]);
             picoquic_reset_ack_context(&cnx->ack_ctx[pc]);
         }
+
+        picoquic_mcquic_delete(cnx);
 
         while (cnx->first_misc_frame != NULL) {
             picoquic_delete_misc_or_dg(&cnx->first_misc_frame, &cnx->last_misc_frame, cnx->first_misc_frame);

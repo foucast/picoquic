@@ -26,6 +26,7 @@
 #include "picoquic_internal.h"
 #include "picoquic_unified_log.h"
 #include "tls_api.h"
+#include "mcquic.h"
 #include <string.h>
 
 uint64_t picoquic_transport_param_varint_decode(picoquic_cnx_t * cnx, uint8_t* bytes, uint64_t extension_length, int* ret) 
@@ -486,6 +487,10 @@ int picoquic_prepare_transport_extensions(picoquic_cnx_t* cnx, int extension_mod
         if (bytes != NULL) {
             bytes = picoquic_transport_param_type_flag_encode(bytes, bytes_max, picoquic_tp_reset_stream_at);
         }
+    }
+
+    if (extension_mode <= 1 && cnx->mcquic_ctx != NULL && bytes != NULL) {
+        bytes = picoquic_mcquic_prepare_transport_parameter(cnx, bytes, bytes_max);
     }
 
     if (extension_mode > 1 && cnx->qmux_local_max_record_size > PICOQMUX_MAX_RECORD_SIZE_DEFAULT && bytes != NULL) {
@@ -979,6 +984,12 @@ int picoquic_receive_transport_extensions(picoquic_cnx_t* cnx, int extension_mod
                     }
                     break;
                 default:
+                    if (extension_type == PICOQUIC_MCQUIC_TP_SERVER_SUPPORT && extension_mode == 1) {
+                        ret = picoquic_mcquic_receive_server_support(cnx, extension_length);
+                    }
+                    else if (extension_type == PICOQUIC_MCQUIC_TP_CLIENT_PARAMS && extension_mode == 0) {
+                        ret = picoquic_mcquic_receive_client_params(cnx, bytes + byte_index, (size_t)extension_length);
+                    }
                     /* ignore unknown extensions */
                     break;
                 }

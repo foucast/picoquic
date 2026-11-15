@@ -132,6 +132,7 @@
 #include "picoquic_qlog.h"
 #include "performance_log.h"
 #include "picoquic_packet_loop.h"
+#include "mcquic_loop.h"
 #include "picoquic_af_xdp.h"
 #include "picoquic_unified_log.h"
 #include "picoqmux.h"
@@ -3031,7 +3032,8 @@ void* picoquic_packet_loop_v3(void* v_ctx)
     }
 #elif defined(PICOQUIC_WITH_POLL)
     if (ret == 0) {
-        poll_list_size = (size_t)(nb_sockets + max_qmux_sockets + 1);
+        /* Room for sockets opened later: new destinations, multicast channels */
+        poll_list_size = (size_t)(PICOQUIC_PACKET_LOOP_SOCKETS_MAX + max_qmux_sockets + 1);
         if ((poll_list = (struct pollfd*)malloc(sizeof(struct pollfd) * poll_list_size)) == NULL) {
             ret = -1;
         }
@@ -3128,6 +3130,10 @@ void* picoquic_packet_loop_v3(void* v_ctx)
         else {
             nb_loop_immediate++;
         }
+        /* Multicast channel sockets joined or left since the last pass, and
+         * due MC_ACK or MC_INTEGRITY frames (mcquic_loop.c) */
+        picoquic_mcquic_loop_prepare(quic, s_ctx, &nb_sockets, &nb_sockets_available, PICOQUIC_PACKET_LOOP_SOCKETS_MAX,
+            current_time, (loop_immediate) ? NULL : &delta_t);
         /* The "loop immediate flag is set by default to zero. It will be
         * set to 1 if a packet has been received and the number of
         * packets received "immediately" does not exceed the limit.
@@ -3205,6 +3211,12 @@ void* picoquic_packet_loop_v3(void* v_ctx)
                 }
                 break;
             case picoquic_packet_loop_action_udp_received:
+                if (socket_rank >= 0 && socket_rank < nb_sockets_available && s_ctx[socket_rank].is_multicast) {
+                    /* A multicast channel packet: not a packet of the connection's own number space */
+                    (void)picoquic_mcquic_loop_incoming(quic, received_buffer, (size_t)bytes_recv,
+                        (struct sockaddr*)&addr_from, current_time);
+                    break;
+                }
                 ret = picoquic_packet_loop_udp_received(quic, &last_cnx,
 #ifdef _WINDOWS
                     s_ctx, socket_rank,
@@ -3266,6 +3278,9 @@ void* picoquic_packet_loop_v3(void* v_ctx)
                 ret = 0;
             }
 
+            /* Channel packets queued by a multicast sender */
+            picoquic_mcquic_loop_send(quic, current_time);
+
             /* We limit the number of packets sent in a loop, no make sure that
             * the code will not spend a lot of time sending packets while
             * packets may be adding in the receive queue.
@@ -3306,7 +3321,7 @@ void* picoquic_packet_loop_v3(void* v_ctx)
 
                     /* TODO: verify htons/ntohs */
                     for (int i = 0; i < nb_sockets_available; i++) {
-                        if (s_ctx[i].af == peer_addr.ss_family) {
+                        if (s_ctx[i].af == peer_addr.ss_family && !s_ctx[i].is_multicast) {
                             send_socket = s_ctx[i].fd;
                             send_ctx = &s_ctx[i];
                             if (send_port == 0 && !param->prefer_extra_socket) {
@@ -3395,8 +3410,11 @@ void* picoquic_packet_loop_v3(void* v_ctx)
         thread_ctx->af_xdp = NULL;
     }
 
-    /* Close the sockets */
+    /* Close the sockets; multicast channel sockets belong to mcquic_loop.c */
     for (int i = 0; i < nb_sockets; i++) {
+        if (s_ctx[i].is_multicast) {
+            s_ctx[i].fd = INVALID_SOCKET;
+        }
         picoquic_packet_loop_close_socket(&s_ctx[i]);
     }
     

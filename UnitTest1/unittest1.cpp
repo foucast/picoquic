@@ -897,6 +897,69 @@ namespace UnitTest1
             Assert::AreEqual(ret, 0);
         }
 
+        TEST_METHOD(mcquic_kat_keys)
+        {
+            int ret = mcquic_kat_keys_test();
+
+            Assert::AreEqual(ret, 0);
+        }
+
+        TEST_METHOD(mcquic_kat_header)
+        {
+            int ret = mcquic_kat_header_test();
+
+            Assert::AreEqual(ret, 0);
+        }
+
+        TEST_METHOD(mcquic_kat_decrypt)
+        {
+            int ret = mcquic_kat_decrypt_test();
+
+            Assert::AreEqual(ret, 0);
+        }
+
+        TEST_METHOD(mcquic_kat_integrity)
+        {
+            int ret = mcquic_kat_integrity_test();
+
+            Assert::AreEqual(ret, 0);
+        }
+
+        TEST_METHOD(mcquic_kat_tp)
+        {
+            int ret = mcquic_kat_tp_test();
+
+            Assert::AreEqual(ret, 0);
+        }
+
+        TEST_METHOD(mcquic_kat_frames)
+        {
+            int ret = mcquic_kat_frames_test();
+
+            Assert::AreEqual(ret, 0);
+        }
+
+        TEST_METHOD(mcquic_kat_encode)
+        {
+            int ret = mcquic_kat_encode_test();
+
+            Assert::AreEqual(ret, 0);
+        }
+
+        TEST_METHOD(mcquic_kat_hash_ids)
+        {
+            int ret = mcquic_kat_hash_ids_test();
+
+            Assert::AreEqual(ret, 0);
+        }
+
+        TEST_METHOD(mcquic_receive)
+        {
+            int ret = mcquic_receive_test();
+
+            Assert::AreEqual(ret, 0);
+        }
+
         TEST_METHOD(new_cnxid_stash)
         {
             int ret = cnxid_stash_test();

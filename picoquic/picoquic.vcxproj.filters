@@ -138,6 +138,12 @@
     <ClCompile Include="loss_recovery.c">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="mcquic.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="mcquic_loop.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="picoquic_mbedtls.c">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -198,6 +204,12 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="tls_api.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="mcquic.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="mcquic_loop.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="picoquic_internal.h">

@@ -691,7 +691,10 @@ typedef struct st_picoquic_quic_t {
 #ifdef PICOQUIC_WITH_THREAD_CHECK
     uint64_t thread_id;
 #endif
-
+    /* Multicast sender (mcquic.c), NULL unless created */
+    struct st_picoquic_mcquic_sender_t* mcquic_sender;
+    /* Multicast sockets owned by the packet loop (mcquic_loop.c), NULL unless configured */
+    struct st_picoquic_mcquic_loop_t* mcquic_loop;
 } picoquic_quic_t;
 
 picoquic_packet_context_enum picoquic_context_from_epoch(int epoch);
@@ -1367,6 +1370,8 @@ typedef struct st_picoquic_cnx_t {
     /* Call back function and context */
     picoquic_stream_data_cb_fn callback_fn;
     void* callback_ctx;
+    /* Multicast receiver state (mcquic.c), NULL unless enabled */
+    struct st_picoquic_mcquic_ctx_t* mcquic_ctx;
 
     /* connection state, ID, etc. Todo: allow for multiple cnxid */
     picoquic_state_enum cnx_state;

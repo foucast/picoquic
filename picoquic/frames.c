@@ -26,6 +26,7 @@
 #include <string.h>
 #include "picoquic_internal.h"
 #include "tls_api.h"
+#include "mcquic.h"
 
 static const size_t challenge_length = 8;
 
@@ -6939,6 +6940,11 @@ int picoquic_decode_frames(picoquic_cnx_t* cnx, picoquic_path_t * path_x, const 
                             bytes = picoquic_decode_observed_address_frame(cnx, bytes, bytes_max, path_x, frame_id64);
                             break;
                         default:
+                            if (cnx->mcquic_ctx != NULL && picoquic_mcquic_is_frame_type(frame_id64)) {
+                                bytes = picoquic_mcquic_decode_control_frame(cnx, bytes, bytes_max, frame_id64, current_time);
+                                ack_needed = 1;
+                                break;
+                            }
                             /* Not implemented yet! */
                             picoquic_connection_error(cnx, PICOQUIC_TRANSPORT_PROTOCOL_VIOLATION, frame_id64);
                             bytes = NULL;
@@ -7257,6 +7263,10 @@ int picoquic_skip_frame(const uint8_t* bytes, size_t bytes_maxsize, size_t* cons
                     *pure_ack = 0;
                     break;
                 default:
+                    if (picoquic_mcquic_is_frame_type(frame_id64)) {
+                        bytes = picoquic_mcquic_frame_skip(bytes, bytes_max, frame_id64, pure_ack);
+                        break;
+                    }
                     /* Not implemented yet! */
                     bytes = NULL;
                 }
