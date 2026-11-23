@@ -44,7 +44,7 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 build/picoquic_ct mcquic_kat_keys mcquic_kat_header mcquic_kat_decrypt mcquic_kat_integrity \
     mcquic_kat_tp mcquic_kat_frames mcquic_kat_encode mcquic_kat_hash_ids mcquic_kat_ack_policy \
-    mcquic_receive
+    mcquic_server_hash mcquic_server_aead mcquic_receive
 ```
 
 ## Run the examples
@@ -89,6 +89,12 @@ Other options:
     most `ms` (defaults 256 and 25 ms). `n` is also capped so the frame fits
     the path MTU. `-T 0 -H 1` sends one hash per channel packet at once.
   - `-A id` selects the integrity hash algorithm, draft-08 ids 1–8. The default is 5, SHA-256 truncated to 8 bytes.
+    The hash is chosen per client: the configured one if the client lists it,
+    else the first one the client lists that the server supports.
+  - The channel is protected with TLS_AES_128_GCM_SHA256 (0x1301) for every
+    client. A client whose list of encryption algorithms lacks it, or whose
+    list of hashes has none the server supports, gets no MC_ANNOUNCE
+    (draft-08 §3), and the server logs why.
   - `-D ms` sets the Max ACK Delay announced in MC_ANNOUNCE, in milliseconds as
     in draft-08 (default 25). Draft-09 changes the unit to microseconds.
   - `-R kibps` sets the announced Max Rate. By default it is derived from the

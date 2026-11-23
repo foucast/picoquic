@@ -254,6 +254,7 @@ static const picoquic_test_def_t test_table[] = {
     { "mcquic_kat_hash_ids", mcquic_kat_hash_ids_test },
     { "mcquic_kat_ack_policy", mcquic_kat_ack_policy_test },
     { "mcquic_server_hash", mcquic_server_hash_test },
+    { "mcquic_server_aead", mcquic_server_aead_test },
     { "mcquic_receive", mcquic_receive_test },
     { "new_cnxid", new_cnxid_test },
     { "pacing", pacing_test },

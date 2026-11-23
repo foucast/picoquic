@@ -367,8 +367,12 @@ int picoquic_mcquic_sender_get_stats(picoquic_quic_t* quic, picoquic_mcquic_send
  * the configured hash if the client's multicast_client_params lists it, else
  * the first listed hash this sender supports. draft-08 3: the server MUST NOT
  * send an MC_ANNOUNCE for a channel using an algorithm the client did not
- * list, so a client that lists none gets no MC_ANNOUNCE (logged). */
+ * list, so a client that lists none gets no MC_ANNOUNCE (logged).
+ * The same MUST NOT covers the AEAD. The channel packets are protected once,
+ * with the configured cipher suite, for every client, so there is no fallback:
+ * a client whose list lacks that suite gets no MC_ANNOUNCE either (logged). */
 int picoquic_mcquic_server_start(picoquic_cnx_t* cnx);
+uint16_t picoquic_mcquic_choose_aead_alg(uint16_t configured, const picoquic_mcquic_client_params_t* params);
 uint16_t picoquic_mcquic_choose_hash_alg(uint16_t configured, const picoquic_mcquic_client_params_t* params);
 int picoquic_mcquic_get_client_ack_stats(picoquic_cnx_t* cnx, picoquic_mcquic_client_ack_stats_t* stats);
 /* MC_INTEGRITY batching: per client, one frame carries up to max_hashes hashes

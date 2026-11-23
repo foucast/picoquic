@@ -1973,6 +1973,13 @@ static int mcquic_hash_supported(uint16_t hash_alg)
         picoquic_mcquic_integrity_hash(hash_alg, probe, sizeof(probe), hash, sizeof(hash)) == 0;
 }
 
+uint16_t picoquic_mcquic_choose_aead_alg(uint16_t configured, const picoquic_mcquic_client_params_t* params)
+{
+    /* The channel packets are protected once, with the configured suite, for
+     * every client: there is no other suite to fall back to */
+    return mcquic_param_contains(params->cipher_suites, params->nb_cipher_suites, configured) ? configured : 0;
+}
+
 uint16_t picoquic_mcquic_choose_hash_alg(uint16_t configured, const picoquic_mcquic_client_params_t* params)
 {
     if (mcquic_param_contains(params->hash_algs, params->nb_hash_algs, configured) && mcquic_hash_supported(configured)) {
@@ -1985,6 +1992,20 @@ uint16_t picoquic_mcquic_choose_hash_alg(uint16_t configured, const picoquic_mcq
         }
     }
     return 0;
+}
+
+/* The client's algorithm ids, comma-separated, for the log */
+static void mcquic_alg_list(char* list, size_t list_max, const uint16_t* algs, size_t nb_algs, int hex)
+{
+    size_t l = 0;
+
+    list[0] = 0;
+    for (size_t i = 0; i < nb_algs && l + 8 < list_max; i++) {
+        if (i > 0) {
+            list[l++] = ',';
+        }
+        l += (size_t)snprintf(list + l, list_max - l, hex ? "0x%04x" : "%u", algs[i]);
+    }
 }
 
 int picoquic_mcquic_server_start(picoquic_cnx_t* cnx)
@@ -2003,13 +2024,16 @@ int picoquic_mcquic_server_start(picoquic_cnx_t* cnx)
         return 0;
     }
     ctx->announced = 1;
+    if (picoquic_mcquic_choose_aead_alg(sender->config.cipher_suite, &ctx->params) == 0) {
+        char list[8 * PICOQUIC_MCQUIC_ALGS_MAX + 1];
+        mcquic_alg_list(list, sizeof(list), ctx->params.cipher_suites, ctx->params.nb_cipher_suites, 1);
+        mcquic_log(ctx, "client lists no supported AEAD (%s; the channel uses 0x%04x); not announcing", list,
+            sender->config.cipher_suite);
+        return 0;
+    }
     if ((ctx->hash_alg = picoquic_mcquic_choose_hash_alg(sender->config.hash_alg, &ctx->params)) == 0) {
         char list[8 * PICOQUIC_MCQUIC_ALGS_MAX + 1];
-        size_t l = 0;
-        list[0] = 0;
-        for (size_t i = 0; i < ctx->params.nb_hash_algs && l + 8 < sizeof(list); i++) {
-            l += (size_t)snprintf(list + l, sizeof(list) - l, "%s%u", (i == 0) ? "" : ",", ctx->params.hash_algs[i]);
-        }
+        mcquic_alg_list(list, sizeof(list), ctx->params.hash_algs, ctx->params.nb_hash_algs, 0);
         mcquic_log(ctx, "client lists no supported integrity hash (%s); not announcing", list);
         return 0;
     }
@@ -2020,8 +2044,8 @@ int picoquic_mcquic_server_start(picoquic_cnx_t* cnx)
         picoquic_mcquic_sender_frame(&sender->config, PICOQUIC_MCQUIC_FRAME_KEY, &f);
         ret = mcquic_queue_frame(cnx, &f);
     }
-    mcquic_log(ctx, "MC_ANNOUNCE and MC_KEY sent: channel=%s key_sequence=%llu hash=%u", mcquic_id_hex(&sender->config.channel_id, idh),
-        (unsigned long long)sender->config.key_sequence, ctx->hash_alg);
+    mcquic_log(ctx, "MC_ANNOUNCE and MC_KEY sent: channel=%s key_sequence=%llu aead=0x%04x hash=%u", mcquic_id_hex(&sender->config.channel_id, idh),
+        (unsigned long long)sender->config.key_sequence, sender->config.cipher_suite, ctx->hash_alg);
     return ret;
 }
 

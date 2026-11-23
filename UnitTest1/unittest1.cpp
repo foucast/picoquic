@@ -967,6 +967,13 @@ namespace UnitTest1
             Assert::AreEqual(ret, 0);
         }
 
+        TEST_METHOD(mcquic_server_aead)
+        {
+            int ret = mcquic_server_aead_test();
+
+            Assert::AreEqual(ret, 0);
+        }
+
         TEST_METHOD(mcquic_receive)
         {
             int ret = mcquic_receive_test();

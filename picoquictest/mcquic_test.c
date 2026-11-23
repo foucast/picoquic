@@ -783,14 +783,13 @@ static int mcquic_server_hash_pop(picoquic_cnx_t* cnx, uint8_t* copy, size_t cop
     return ret;
 }
 
-/* Sets up a server connection whose client sent multicast_client_params with
- * the given hash list, and calls picoquic_mcquic_server_start() */
-static picoquic_cnx_t* mcquic_server_hash_cnx(picoquic_quic_t* quic, const uint16_t* algs, size_t nb_algs, uint64_t now)
+/* Sets up a server connection whose client sent the given
+ * multicast_client_params, and calls picoquic_mcquic_server_start() */
+static picoquic_cnx_t* mcquic_server_params_cnx(picoquic_quic_t* quic, const picoquic_mcquic_client_params_t* params, uint64_t now)
 {
     static uint16_t port = 4433;
     picoquic_connection_id_t icid;
     struct sockaddr_in peer;
-    picoquic_mcquic_client_params_t params;
     uint8_t tp[64];
     uint8_t* end;
     picoquic_cnx_t* cnx;
@@ -807,15 +806,23 @@ static picoquic_cnx_t* mcquic_server_hash_cnx(picoquic_quic_t* quic, const uint1
         (struct sockaddr*)&peer, now, 0, NULL, "h3", 0)) == NULL) {
         return NULL;
     }
-    picoquic_mcquic_set_default_client_params(&params);
-    params.nb_hash_algs = nb_algs;
-    memcpy(params.hash_algs, algs, nb_algs * sizeof(uint16_t));
-    if ((end = picoquic_mcquic_client_params_encode(tp, tp + sizeof(tp), &params)) == NULL ||
+    if ((end = picoquic_mcquic_client_params_encode(tp, tp + sizeof(tp), params)) == NULL ||
         picoquic_mcquic_receive_client_params(cnx, tp, end - tp) != 0 ||
         picoquic_mcquic_server_start(cnx) != 0) {
         return NULL;
     }
     return cnx;
+}
+
+/* The same, with the default client params but the given hash list */
+static picoquic_cnx_t* mcquic_server_hash_cnx(picoquic_quic_t* quic, const uint16_t* algs, size_t nb_algs, uint64_t now)
+{
+    picoquic_mcquic_client_params_t params;
+
+    picoquic_mcquic_set_default_client_params(&params);
+    params.nb_hash_algs = nb_algs;
+    memcpy(params.hash_algs, algs, nb_algs * sizeof(uint16_t));
+    return mcquic_server_params_cnx(quic, &params, now);
 }
 
 /* The server announces, per connection, a hash the client listed (draft-08 3:
@@ -924,6 +931,90 @@ int mcquic_server_hash_test(void)
     if (ret == 0 && ((cnx = mcquic_server_hash_cnx(quic, unknown, 1, now)) == NULL ||
         picoquic_mcquic_get_client_ack_stats(cnx, &as) != 0 || as.hash_alg != 0 || cnx->first_misc_frame != NULL)) {
         DBG_PRINTF("%s", "no supported hash");
+        ret = -1;
+    }
+
+    if (quic != NULL) {
+        picoquic_free(quic);
+    }
+    return ret;
+}
+
+/* The server announces only to a client that lists the channel's AEAD
+ * (draft-08 3: it MUST NOT announce a channel using an algorithm the client
+ * did not list). The channel has one suite for every client, so there is no
+ * fallback, unlike the hash. */
+int mcquic_server_aead_test(void)
+{
+    static const uint16_t gcm128[] = { PICOQUIC_AES_128_GCM_SHA256 };
+    static const uint16_t chacha_gcm128[] = { PICOQUIC_CHACHA20_POLY1305_SHA256, PICOQUIC_AES_128_GCM_SHA256 };
+    static const uint16_t gcm256_chacha[] = { PICOQUIC_AES_256_GCM_SHA384, PICOQUIC_CHACHA20_POLY1305_SHA256 };
+    uint64_t now = 0;
+    picoquic_quic_t* quic = picoquic_create(8, NULL, NULL, NULL, "h3", NULL, NULL, NULL, NULL, NULL, now, &now, NULL, NULL, 0);
+    picoquic_mcquic_sender_config_t config;
+    picoquic_mcquic_client_params_t params;
+    picoquic_mcquic_frame_t f;
+    picoquic_cnx_t* cnx = NULL;
+    uint8_t copy[512];
+    int ret = 0;
+
+    /* The choice itself */
+    picoquic_mcquic_set_default_client_params(&params);
+    params.nb_cipher_suites = 1;
+    memcpy(params.cipher_suites, gcm128, sizeof(gcm128));
+    if (picoquic_mcquic_choose_aead_alg(PICOQUIC_AES_128_GCM_SHA256, &params) != PICOQUIC_AES_128_GCM_SHA256) {
+        ret = -1;
+    }
+    params.nb_cipher_suites = 2;
+    memcpy(params.cipher_suites, chacha_gcm128, sizeof(chacha_gcm128));
+    if (ret == 0 && picoquic_mcquic_choose_aead_alg(PICOQUIC_AES_128_GCM_SHA256, &params) != PICOQUIC_AES_128_GCM_SHA256) {
+        ret = -1; /* the configured suite, whatever its rank */
+    }
+    memcpy(params.cipher_suites, gcm256_chacha, sizeof(gcm256_chacha));
+    if (ret == 0 && picoquic_mcquic_choose_aead_alg(PICOQUIC_AES_128_GCM_SHA256, &params) != 0) {
+        ret = -1; /* suites picoquic has, but not the channel's */
+    }
+    params.nb_cipher_suites = 0;
+    if (ret == 0 && picoquic_mcquic_choose_aead_alg(PICOQUIC_AES_128_GCM_SHA256, &params) != 0) {
+        ret = -1;
+    }
+
+    /* A sender with the default suite, 0x1301 */
+    picoquic_mcquic_set_default_sender_config(&config);
+    config.source[0] = 192;
+    config.source[1] = 0;
+    config.source[2] = 2;
+    config.source[3] = 1;
+    if (ret == 0 && (quic == NULL || picoquic_mcquic_sender_create(quic, &config) != 0)) {
+        ret = -1;
+    }
+
+    /* Client lists 0x1301: MC_ANNOUNCE with 0x1301 for both header and
+     * payload protection, then MC_KEY */
+    picoquic_mcquic_set_default_client_params(&params);
+    params.nb_cipher_suites = 1;
+    memcpy(params.cipher_suites, gcm128, sizeof(gcm128));
+    if (ret == 0 && ((cnx = mcquic_server_params_cnx(quic, &params, now)) == NULL ||
+        mcquic_server_hash_pop(cnx, copy, sizeof(copy), 0, &f) != 0 ||
+        f.frame_type != PICOQUIC_MCQUIC_FRAME_ANNOUNCE_V4 || f.u.announce.aead_alg != PICOQUIC_AES_128_GCM_SHA256 ||
+        f.u.announce.header_protection_alg != PICOQUIC_AES_128_GCM_SHA256 ||
+        mcquic_server_hash_pop(cnx, copy, sizeof(copy), 0, &f) != 0 || f.frame_type != PICOQUIC_MCQUIC_FRAME_KEY)) {
+        DBG_PRINTF("%s", "aead 0x1301 announce");
+        ret = -1;
+    }
+
+    /* Client lists only suites the channel doesn't use: no MC_ANNOUNCE */
+    params.nb_cipher_suites = 2;
+    memcpy(params.cipher_suites, gcm256_chacha, sizeof(gcm256_chacha));
+    if (ret == 0 && ((cnx = mcquic_server_params_cnx(quic, &params, now)) == NULL || cnx->first_misc_frame != NULL)) {
+        DBG_PRINTF("%s", "no supported aead");
+        ret = -1;
+    }
+
+    /* Client lists none: no MC_ANNOUNCE */
+    params.nb_cipher_suites = 0;
+    if (ret == 0 && ((cnx = mcquic_server_params_cnx(quic, &params, now)) == NULL || cnx->first_misc_frame != NULL)) {
+        DBG_PRINTF("%s", "empty aead list");
         ret = -1;
     }
 
